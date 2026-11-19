@@ -1,0 +1,154 @@
+import { resolveGoogleMerchantCreds, resolveAmazonCreds } from './resolve'
+import { merchantApiRequest } from '@/lib/merchant/client'
+import { spApiRequest } from '@/lib/amazon/client'
+import { getTenantSocialAccounts } from '@/lib/tenant-registry'
+import { decryptToken } from '@/lib/crypto/token-cipher'
+import { getPageInfo } from '@/lib/catalog/meta'
+import { googleAdsClientFor } from '@/lib/google-ads/credentials'
+import { verifyAccount } from '@/lib/google-ads/accounts'
+import { formatCustomerId } from '@/lib/google-ads/client'
+
+// "Test connection" for the store-admin credentials popup: one cheap authenticated read per
+// provider using the stored credentials, so a bad key shows up before a sync or post fails.
+
+export interface ConnectionTestResult {
+  ok: boolean
+  message: string
+}
+
+function failure(e: unknown): ConnectionTestResult {
+  const msg = String((e as any)?.message || e || 'Unknown error')
+  return { ok: false, message: msg.replace(/\s+/g, ' ').slice(0, 400) }
+}
+
+export async function testGoogleMerchant(): Promise<ConnectionTestResult> {
+  try {
+    const creds = await resolveGoogleMerchantCreds()
+    const acct = await merchantApiRequest('GET', `/accounts/v1/accounts/${creds.merchantId}`, { delays: [] })
+    const name = acct?.accountName ? `${acct.accountName} (${creds.merchantId})` : creds.merchantId
+    return { ok: true, message: `Reached Merchant Center account ${name}.` }
+  } catch (e) {
+    return failure(e)
+  }
+}
+
+export async function testAmazonSeller(): Promise<ConnectionTestResult> {
+  try {
+    const creds = await resolveAmazonCreds()
+    const data = await spApiRequest('GET', '/sellers/v1/marketplaceParticipations')
+    const ids: string[] = (data?.payload ?? []).map((p: any) => p?.marketplace?.id).filter(Boolean)
+    if (ids.length && !ids.includes(creds.marketplaceId)) {
+      return {
+        ok: false,
+        message: `Signed in, but the seller does not participate in marketplace ${creds.marketplaceId} (has ${ids.join(', ')}).`,
+      }
+    }
+    return { ok: true, message: `Reached Amazon seller ${creds.sellerId || '(unknown id)'} on ${creds.marketplaceId}.` }
+  } catch (e) {
+    return failure(e)
+  }
+}
+
+export async function testMeta(tenantId: string): Promise<ConnectionTestResult> {
+  try {
+    const accounts = await getTenantSocialAccounts(tenantId)
+    const fb = accounts.find(a => a.provider === 'facebook') ?? accounts[0]
+    if (!fb?.page_id) return { ok: false, message: 'Meta is not connected.' }
+    const page = await getPageInfo(fb.page_id, decryptToken(fb.access_token_enc))
+    const ig = accounts.find(a => a.provider === 'instagram')
+    const igNote = ig
+      ? page.igUserId === ig.ig_user_id
+        ? ' Instagram linked.'
+        : ' Instagram link changed; reconnect.'
+      : ''
+    return { ok: true, message: `Reached Facebook Page ${page.pageName || page.pageId}.${igNote}` }
+  } catch (e) {
+    return failure(e)
+  }
+}
+
+export async function testGoogleAds(tenantId?: string | null): Promise<ConnectionTestResult> {
+  try {
+    const client = await googleAdsClientFor(tenantId, { retryDelays: [] })
+    const info = await verifyAccount(client)
+    const via = client.loginCustomerId ? ` through manager ${formatCustomerId(client.loginCustomerId)}` : ''
+    const test = info.test_account ? ' (test account)' : ''
+    return {
+      ok: true,
+      message: `Reached Google Ads account ${info.descriptive_name || ''} ${formatCustomerId(info.customer_id)}${test}${via}.`.replace(/\s+/g, ' '),
+    }
+  } catch (e) {
+    return failure(e)
+  }
+}
+
+/** Live check of a Razorpay key pair: one authenticated read. Mode comes from the key's prefix. */
+export async function verifyRazorpayKeys(keyId: string, keySecret: string): Promise<ConnectionTestResult> {
+  if (!/^rzp_(live|test)_[A-Za-z0-9]+$/.test(keyId)) return { ok: false, message: 'The key id should look like rzp_live_… or rzp_test_….' }
+  try {
+    const { default: Razorpay } = await import('razorpay')
+    await new Razorpay({ key_id: keyId, key_secret: keySecret }).payments.all({ count: 1 })
+    return { ok: true, message: `Reached Razorpay with ${keyId.startsWith('rzp_live_') ? 'live' : 'test'} keys.` }
+  } catch (e: any) {
+    const status = Number(e?.statusCode ?? e?.status)
+    if (status === 401) return { ok: false, message: 'Razorpay rejected these keys. Check the key id and secret.' }
+    return failure(e?.error?.description ?? e)
+  }
+}
+
+/** PhonePe PG v2 OAuth host per environment (docs/plans/UPI_AND_MESSAGING_ADDON.md §1.1). */
+import { PHONEPE_AUTH_BASE } from '@/lib/payments/upi/phonepe'
+export { PHONEPE_AUTH_BASE }
+
+/** Live check of PhonePe client credentials: one token request. Nothing is cached or stored. */
+export async function verifyPhonePeCreds(c: { env: 'sandbox' | 'production'; client_id: string; client_secret: string; client_version: string }): Promise<ConnectionTestResult> {
+  const body = new URLSearchParams({ client_id: c.client_id, client_version: c.client_version, client_secret: c.client_secret, grant_type: 'client_credentials' })
+  try {
+    const res = await fetch(`${PHONEPE_AUTH_BASE[c.env]}/v1/oauth/token`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+      signal: AbortSignal.timeout(10_000),
+    })
+    const json: any = await res.json().catch(() => ({}))
+    if (res.ok && json?.access_token) return { ok: true, message: `Reached PhonePe (${c.env}) and got a token.` }
+    if (res.status === 400 || res.status === 401) return { ok: false, message: `PhonePe rejected these credentials${json?.message ? `: ${json.message}` : ''}. Check the client id, secret and version.` }
+    return { ok: false, message: `PhonePe answered ${res.status}${json?.message ? `: ${json.message}` : ''}.` }
+  } catch (e) {
+    return failure(e)
+  }
+}
+
+/** A store's saved PhonePe creds against PhonePe, or the platform's (saved, else env) for the flagship. */
+export async function testPhonePe(tenantId?: string): Promise<ConnectionTestResult> {
+  try {
+    const { storedPhonePeCreds } = await import('./resolve')
+    const { PLATFORM_TENANT_ID } = await import('@/lib/import/jobs')
+    const creds = tenantId
+      ? await storedPhonePeCreds(tenantId)
+      : (await storedPhonePeCreds(PLATFORM_TENANT_ID).catch(() => null)) ?? (process.env.PHONEPE_CLIENT_ID && process.env.PHONEPE_CLIENT_SECRET
+        ? {
+            env: process.env.PHONEPE_ENV === 'production' ? ('production' as const) : ('sandbox' as const),
+            client_id: process.env.PHONEPE_CLIENT_ID,
+            client_secret: process.env.PHONEPE_CLIENT_SECRET,
+            client_version: process.env.PHONEPE_CLIENT_VERSION || '1',
+          }
+        : null)
+    if (!creds) return { ok: false, message: 'No PhonePe credentials are set.' }
+    return verifyPhonePeCreds(creds)
+  } catch (e) {
+    return failure(e)
+  }
+}
+
+/** A store's saved Razorpay keys against Razorpay (whatever its mode), or the platform's for the flagship. */
+export async function testRazorpay(tenantId?: string): Promise<ConnectionTestResult> {
+  try {
+    const { resolveRazorpayCreds, storedRazorpayKeys } = await import('./resolve')
+    const creds = tenantId ? await storedRazorpayKeys(tenantId) : await resolveRazorpayCreds()
+    if (!creds?.key_id || !creds.key_secret) return { ok: false, message: 'No Razorpay keys are set.' }
+    return verifyRazorpayKeys(creds.key_id, creds.key_secret)
+  } catch (e) {
+    return failure(e)
+  }
+}

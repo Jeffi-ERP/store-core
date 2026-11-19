@@ -1,0 +1,142 @@
+'use client'
+
+import { SECTION_META, rowAudience, rowPage, type SectionType } from '@/lib/catalog/homepage-sections'
+import {
+  AiCopyScope,
+  AspectField,
+  DateTimeField,
+  Grid,
+  PlacementFields,
+  SidesField,
+  useSectionBinding,
+  type EditorProps,
+} from './editors/fields'
+import AboutEditor from './editors/AboutEditor'
+import BackInStockEditor from './editors/BackInStockEditor'
+import BenefitsEditor from './editors/BenefitsEditor'
+import BlogTeaserEditor from './editors/BlogTeaserEditor'
+import BrandCarouselEditor from './editors/BrandCarouselEditor'
+import BundleSpotlightEditor from './editors/BundleSpotlightEditor'
+import BusinessAccountEditor from './editors/BusinessAccountEditor'
+import BusinessCtaEditor from './editors/BusinessCtaEditor'
+import BusinessOffersEditor from './editors/BusinessOffersEditor'
+import BusinessQuotesEditor from './editors/BusinessQuotesEditor'
+import BusinessReorderEditor from './editors/BusinessReorderEditor'
+import CategoryGridEditor from './editors/CategoryGridEditor'
+import CategoryShowcaseEditor from './editors/CategoryShowcaseEditor'
+import CategoryTabsEditor from './editors/CategoryTabsEditor'
+import CountdownDealEditor from './editors/CountdownDealEditor'
+import DealOfTheDayEditor from './editors/DealOfTheDayEditor'
+import FeaturedForYouEditor from './editors/FeaturedForYouEditor'
+import MotionHeroEditor from './editors/MotionHeroEditor'
+import ProductRowEditor from './editors/ProductRowEditor'
+import ProductSpotlightEditor from './editors/ProductSpotlightEditor'
+import PromoBannerEditor from './editors/PromoBannerEditor'
+import RecentlyViewedEditor from './editors/RecentlyViewedEditor'
+import RewardsGameEditor from './editors/RewardsGameEditor'
+import SlidesEditor from './editors/SlidesEditor'
+import SocialStripEditor from './editors/SocialStripEditor'
+import StoriesEditor from './editors/StoriesEditor'
+import TestimonialsEditor from './editors/TestimonialsEditor'
+import TrustStripEditor from './editors/TrustStripEditor'
+import ValueStatsEditor from './editors/ValueStatsEditor'
+import WhyUsEditor from './editors/WhyUsEditor'
+
+// `hero` is absent: its slides are edited by HeroSlideManager, which the settings page embeds.
+const EDITORS: Partial<Record<SectionType, (props: EditorProps) => React.ReactElement>> = {
+  about: AboutEditor,
+  back_in_stock: BackInStockEditor,
+  benefits: BenefitsEditor,
+  blog_teaser: BlogTeaserEditor,
+  brand_carousel: BrandCarouselEditor,
+  bundle_spotlight: BundleSpotlightEditor,
+  business_account: BusinessAccountEditor,
+  business_cta: BusinessCtaEditor,
+  business_offers: BusinessOffersEditor,
+  business_quotes: BusinessQuotesEditor,
+  business_reorder: BusinessReorderEditor,
+  category_grid: CategoryGridEditor,
+  category_showcase: CategoryShowcaseEditor,
+  category_tabs: CategoryTabsEditor,
+  countdown_deal: CountdownDealEditor,
+  deal_of_the_day: DealOfTheDayEditor,
+  featured_for_you: FeaturedForYouEditor,
+  motion_hero: MotionHeroEditor,
+  product_row: ProductRowEditor,
+  product_spotlight: ProductSpotlightEditor,
+  promo_banner: PromoBannerEditor,
+  recently_viewed: RecentlyViewedEditor,
+  rewards_game: RewardsGameEditor,
+  slides: SlidesEditor,
+  social_strip: SocialStripEditor,
+  stories: StoriesEditor,
+  testimonials: TestimonialsEditor,
+  trust_strip: TrustStripEditor,
+  value_stats: ValueStatsEditor,
+  why_us: WhyUsEditor,
+}
+
+export default function SectionConfigFields(props: EditorProps) {
+  const { section } = props
+  const Editor = EDITORS[section.type]
+  const meta = SECTION_META[section.type]
+  const page = rowPage(section)
+  const home = rowAudience(section) === 'business' ? 'business homepage' : 'homepage'
+  const where = page === 'home' ? `the ${home}` : `the ${PAGE_NAMES[page]}, between the products`
+  const heading = section.title ? ` Section heading: "${section.title}".` : ''
+  const aiContext = `Section "${meta.label}" on ${where}: ${meta.description}${heading}`
+
+  return (
+    <div className="space-y-4">
+      {Editor && (
+        <AiCopyScope context={aiContext}>
+          <Editor {...props} />
+        </AiCopyScope>
+      )}
+      {(page !== 'home' || meta.aspect) && (
+        <div className="pt-3 border-t border-border-default space-y-3">
+          <p className="text-xs font-semibold text-foreground">Position and shape</p>
+          {page !== 'home' && <PlacementFields props={props} />}
+          {meta.aspect && (
+            <Grid>
+              <AspectField props={props} />
+              <SidesField props={props} />
+            </Grid>
+          )}
+        </div>
+      )}
+      <Scheduling {...props} />
+    </div>
+  )
+}
+
+const PAGE_NAMES = { products: 'all-products page', category: 'category pages', brand: 'brand pages' } as const
+
+function Scheduling(props: EditorProps) {
+  const { section, canWrite } = props
+  const b = useSectionBinding(props)
+
+  return (
+    <div className="pt-3 border-t border-border-default">
+      <p className="text-xs font-semibold text-foreground mb-2">Scheduling</p>
+      <Grid>
+        <DateTimeField
+          label="Show from"
+          value={section.starts_at}
+          disabled={!canWrite}
+          placeholder="Show immediately"
+          hint="Leave empty to show immediately."
+          onCommit={v => b.saveColumn({ starts_at: v }, { startsAt: v })}
+        />
+        <DateTimeField
+          label="Hide after"
+          value={section.ends_at}
+          disabled={!canWrite}
+          placeholder="Never hide"
+          hint="Use this for seasonal or sale sections."
+          onCommit={v => b.saveColumn({ ends_at: v }, { endsAt: v })}
+        />
+      </Grid>
+    </div>
+  )
+}

@@ -1,0 +1,46 @@
+import { vi, describe, it, expect } from 'vitest'
+
+vi.mock('@/lib/shared/db', () => ({ queryMany: vi.fn(), query: vi.fn() }))
+vi.mock('@/lib/shared/automation-emails', () => ({
+  APP_URL: 'https://jeffistores.com',
+  fetchUserContext: vi.fn(),
+  resolveCoupon: vi.fn(),
+  sendCampaignEmail: vi.fn(),
+  renderItemRows: vi.fn().mockReturnValue(''),
+}))
+
+import { winback180 } from '@/lib/campaigns/scenarios/winback-180'
+import { days } from '@/lib/campaigns/duration'
+
+describe('winback180 scenario', () => {
+  it('has correct kind', () => {
+    expect(winback180.kind).toBe('winback_180')
+  })
+
+  it('has correct name', () => {
+    expect(winback180.name).toBe('Win-Back (180 days, dormant)')
+  })
+
+  it('defaultParams use deep dormant window (canonical minutes)', () => {
+    expect(winback180.defaultParams.minDaysSinceOrder).toBe(days(150))
+    expect(winback180.defaultParams.maxDaysSinceOrder).toBe(days(365))
+  })
+
+  it('has no health-score cut by default: the old under-25 cut matched nobody', () => {
+    expect(winback180.defaultParams.healthScoreMin).toBe(0)
+    expect(winback180.defaultParams.healthScoreMax).toBe(100)
+  })
+
+  it('has findEligible function', () => {
+    expect(typeof winback180.findEligible).toBe('function')
+  })
+
+  it('has send function', () => {
+    expect(typeof winback180.send).toBe('function')
+  })
+
+  it('has paramSchema', () => {
+    expect(winback180.paramSchema).toBeDefined()
+    expect(Object.keys(winback180.paramSchema)).toHaveLength(8)
+  })
+})

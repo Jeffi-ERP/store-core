@@ -1,0 +1,155 @@
+'use client'
+
+import { useState } from 'react'
+import Link from 'next/link'
+import { useRouter } from 'next/navigation'
+import { useConfirm } from '@/contexts/ConfirmContext'
+import { RequireWrite } from '@/contexts/AdminScopesContext'
+import { DraftLockBadge } from '@/components/admin/kit/draft-lock'
+import type { DraftLockChip } from '@/lib/client/draft-lock-client'
+import type { MergeConflict } from '@/lib/admin/draft-merge'
+import MergeDialog from '@/components/admin/drafts/MergeDialog'
+
+interface Props {
+  entityId: string
+  name: string
+  subtitle?: string | null
+  updatedAt: string
+  editHref: string
+  publishPath: string
+  discardPath: string
+  entityLabel?: string
+  // Defaults suit an edit-draft (POST to publish staged changes). A create-draft overrides these:
+  // publish is a PATCH that activates the row, discard DELETEs the row, and the copy differs.
+  publishMethod?: 'POST' | 'PATCH'
+  publishBody?: Record<string, unknown>
+  publishConfirm?: string
+  discardConfirm?: string
+  /** Who holds the draft (draftLockChips). Publish is hidden while someone else holds it. */
+  lock?: DraftLockChip | null
+}
+
+export default function DraftRowActions({
+  name,
+  subtitle,
+  updatedAt,
+  editHref,
+  publishPath,
+  discardPath,
+  entityLabel = 'item',
+  publishMethod = 'POST',
+  publishBody,
+  publishConfirm,
+  discardConfirm,
+  lock,
+}: Props) {
+  const lockedByOther = !!lock && !lock.mine
+  const router = useRouter()
+  const confirm = useConfirm()
+  const [publishing, setPublishing] = useState(false)
+  const [discarding, setDiscarding] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [conflicts, setConflicts] = useState<MergeConflict[] | null>(null)
+
+  async function handlePublish() {
+    const ok = await confirm({
+      message: publishConfirm || `Apply all staged changes for "${name}" to the live ${entityLabel}?`,
+      confirmLabel: 'Publish',
+    })
+    if (!ok) return
+    setPublishing(true)
+    setError(null)
+    try {
+      const res = await fetch(publishPath, {
+        method: publishMethod,
+        credentials: 'include',
+        ...(publishBody ? { headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(publishBody) } : {}),
+      })
+      const data = await res.json()
+      if (res.status === 409 && data.code === 'DRAFT_CONFLICT') {
+        setConflicts(data.conflicts ?? [])
+        return
+      }
+      if (!res.ok) {
+        setError(data.error || 'Publish failed')
+        return
+      }
+      router.refresh()
+    } catch {
+      setError('Network error')
+    } finally {
+      setPublishing(false)
+    }
+  }
+
+  async function handleDiscard() {
+    const ok = await confirm({
+      message: discardConfirm || `Discard all unsaved changes for "${name}"? This cannot be undone.`,
+      variant: 'danger',
+      confirmLabel: 'Discard',
+    })
+    if (!ok) return
+    setDiscarding(true)
+    setError(null)
+    try {
+      const res = await fetch(discardPath, { method: 'DELETE', credentials: 'include' })
+      const data = await res.json()
+      if (!res.ok) {
+        setError(data.error || 'Discard failed')
+        return
+      }
+      router.refresh()
+    } catch {
+      setError('Network error')
+    } finally {
+      setDiscarding(false)
+    }
+  }
+
+  return (
+    <div className="flex items-center justify-between px-4 py-2.5 hover:bg-amber-100 dark:hover:bg-amber-900/30 transition-colors">
+      <Link href={editHref} className="flex-1 min-w-0 mr-4">
+        <p className="text-sm font-medium text-amber-900 dark:text-amber-200 break-words">{name}</p>
+        {subtitle && <p className="text-xs text-amber-600 dark:text-amber-400">{subtitle}</p>}
+        {error && <p className="text-xs text-red-500 mt-0.5">{error}</p>}
+      </Link>
+      <div className="flex items-center gap-2 shrink-0">
+        <DraftLockBadge lock={lock} mine={lock?.mine} />
+        <p className="text-xs text-amber-500 mr-2">
+          {new Date(updatedAt).toLocaleDateString('en-IN', { day: 'numeric', month: 'short' })}
+        </p>
+        <RequireWrite scope="orders:write">
+          {!lockedByOther && (
+            <button
+              onClick={handlePublish}
+              disabled={publishing || discarding}
+              className="px-2.5 h-control-sm text-xs font-semibold bg-green-600 hover:bg-green-700 text-white rounded-md transition-colors disabled:opacity-50"
+            >
+              {publishing ? '…' : 'Publish'}
+            </button>
+          )}
+          <button
+            onClick={handleDiscard}
+            disabled={publishing || discarding}
+            className="px-2.5 h-control-sm text-xs font-semibold bg-surface border border-amber-300 dark:border-amber-600 text-amber-800 dark:text-amber-300 hover:bg-amber-100 dark:hover:bg-amber-900/40 rounded-md transition-colors disabled:opacity-50"
+          >
+            {discarding ? '…' : 'Discard'}
+          </button>
+        </RequireWrite>
+      </div>
+      {conflicts && (
+        <MergeDialog
+          open
+          conflicts={conflicts}
+          publishPath={publishPath}
+          extraBody={publishBody}
+          onClose={() => setConflicts(null)}
+          onDone={() => {
+            setConflicts(null)
+            router.refresh()
+          }}
+        />
+      )}
+    </div>
+  )
+}

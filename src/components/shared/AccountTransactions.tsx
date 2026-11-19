@@ -1,0 +1,266 @@
+'use client'
+
+import { useAuth } from '@/contexts/AuthContext'
+import { useRouter } from 'next/navigation'
+import { useEffect, useState, useMemo } from 'react'
+import Link from 'next/link'
+import { bp } from '@/lib/shared/business-path'
+import AccountMobileHeader from '@/components/visitor/AccountMobileHeader'
+import BusinessAccountMobileHeader from '@/components/business/AccountMobileHeader'
+import { useInfiniteList, InfiniteFooter } from '@/components/admin/kit/infinite'
+import { TransactionsSkeleton } from '@/components/visitor/skeletons/account'
+
+interface Transaction {
+  id: string
+  transactionId: string
+  paymentMethod: string
+  paymentGateway: string
+  amount: number
+  status: string
+  createdAt: string
+  updatedAt: string
+  orderId: string
+  orderNumber: string
+}
+
+function getStatusColor(status: string) {
+  switch (status) {
+    case 'completed':
+      return 'bg-green-100 dark:bg-green-900/30 text-green-800 dark:text-green-300'
+    case 'pending':
+      return 'bg-yellow-100 dark:bg-yellow-900/30 text-yellow-800 dark:text-yellow-300'
+    case 'failed':
+      return 'bg-red-100 dark:bg-red-900/30 text-red-800 dark:text-red-300'
+    case 'refunded':
+      return 'bg-purple-100 dark:bg-purple-900/30 text-purple-800 dark:text-purple-300'
+    default:
+      return 'bg-surface-secondary text-foreground'
+  }
+}
+
+function getStatusLabel(status: string) {
+  switch (status) {
+    case 'completed':
+      return 'Completed'
+    case 'pending':
+      return 'Pending'
+    case 'failed':
+      return 'Failed'
+    case 'refunded':
+      return 'Refunded'
+    default:
+      return status
+  }
+}
+
+function getMethodLabel(method: string, gateway: string) {
+  if (gateway === 'razorpay') return 'Razorpay'
+  if (method === 'cod') return 'Cash on Delivery'
+  if (method === 'bank_transfer') return 'Bank Transfer'
+  if (method === 'upi') return 'UPI'
+  return method ? method.charAt(0).toUpperCase() + method.slice(1) : 'N/A'
+}
+
+function AccountTransactions({ isBusiness }: { isBusiness: boolean }) {
+  const { user, isLoading: authLoading } = useAuth()
+  const router = useRouter()
+  const [filterStatus, setFilterStatus] = useState<string>('all')
+  const [filterMethod, setFilterMethod] = useState<string>('all')
+
+  const browsePath = isBusiness ? bp('/business/products') : '/products'
+  const orderPath = (orderId: string) =>
+    isBusiness ? bp(`/business/account/orders/${orderId}`) : `/account/orders/${orderId}`
+
+  // Accumulates pages client-side as the user scrolls; replaces the prev/next pager.
+  const list = useInfiniteList<Transaction>({
+    key: user ? `txns-${isBusiness ? 'b' : 'v'}-${user.id}` : null,
+    pageSize: 10,
+    fetchPage: async (p, signal) => {
+      const res = await fetch(`/api/transactions?page=${p}`, {
+        ...(isBusiness ? { credentials: 'include' } : {}),
+        headers: isBusiness ? { 'X-Auth-Portal': 'business' } : {},
+        signal,
+      })
+      if (!res.ok) throw new Error('Could not load transactions')
+      const data = await res.json()
+      return { rows: (data.transactions || []) as Transaction[], total: Number(data.total ?? 0) }
+    },
+    getKey: t => t.id,
+  })
+
+  const transactions = list.rows
+  const initialLoading = list.loading && transactions.length === 0
+
+  const availableMethods = useMemo(() => {
+    const set = new Set<string>()
+    transactions.forEach(t => set.add(getMethodLabel(t.paymentMethod, t.paymentGateway)))
+    return Array.from(set)
+  }, [transactions])
+
+  const filteredTransactions = useMemo(() => {
+    return transactions.filter(t => {
+      if (filterStatus !== 'all' && t.status !== filterStatus) return false
+      if (filterMethod !== 'all' && getMethodLabel(t.paymentMethod, t.paymentGateway) !== filterMethod) return false
+      return true
+    })
+  }, [transactions, filterStatus, filterMethod])
+
+  useEffect(() => {
+    if (!authLoading && !user) {
+      router.push(
+        isBusiness
+          ? bp('/business/signin?callbackUrl=/business/account/transactions')
+          : '/login?redirect=/account/transactions'
+      )
+    }
+  }, [user, authLoading, router, isBusiness])
+
+  if (authLoading || initialLoading) return <TransactionsSkeleton portal={isBusiness ? 'business' : 'store'} />
+
+  if (!user) return null
+
+  return (
+    <div className="bg-surface min-h-screen">
+      {/* Mobile header */}
+      {isBusiness ? <BusinessAccountMobileHeader /> : <AccountMobileHeader />}
+
+      <div className="container mx-auto px-4 pt-4 pb-8">
+        {/* Filters */}
+        {transactions.length > 0 && (
+          <div className="flex flex-wrap items-center gap-3 mb-4">
+            <div className="flex items-center gap-1.5 flex-wrap">
+              {(['all', 'completed', 'pending', 'failed', 'refunded'] as const).map(s => (
+                <button
+                  key={s}
+                  onClick={() => setFilterStatus(s)}
+                  className={`ui-btn px-3 py-1 rounded-full text-xs font-medium transition-colors ${
+                    filterStatus === s
+                      ? 'bg-accent-500 text-white'
+                      : 'bg-surface-elevated border border-border-default text-foreground-secondary hover:bg-surface-secondary'
+                  }`}
+                >
+                  {s === 'all' ? 'All' : getStatusLabel(s)}
+                </button>
+              ))}
+            </div>
+            {availableMethods.length > 1 && (
+              <select
+                value={filterMethod}
+                onChange={e => setFilterMethod(e.target.value)}
+                className="text-xs px-3 py-1 rounded-full border border-border-default bg-surface-elevated text-foreground-secondary focus:outline-none focus:ring-1 focus:ring-accent-500"
+              >
+                <option value="all">All Methods</option>
+                {availableMethods.map(m => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))}
+              </select>
+            )}
+          </div>
+        )}
+
+        <div>
+          {transactions.length === 0 && !list.loading ? (
+            <div className="ui-card bg-surface-elevated rounded-lg shadow-sm border border-border-default p-12 text-center">
+              <svg
+                className="w-16 h-16 text-foreground-muted mx-auto mb-4"
+                fill="none"
+                viewBox="0 0 24 24"
+                stroke="currentColor"
+              >
+                <path
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  strokeWidth={1.5}
+                  d="M9 14l6-6m-5.5.5h.01m4.99 5h.01M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16l3.5-2 3.5 2 3.5-2 3.5 2z"
+                />
+              </svg>
+              <h3 className="ui-heading text-xl font-semibold text-foreground mb-2">No transactions yet</h3>
+              <p className="text-foreground-secondary mb-6">
+                Your payment transactions will appear here once you place an order.
+              </p>
+              <Link
+                href={browsePath}
+                className="ui-btn inline-block px-6 py-3 bg-accent-500 hover:bg-accent-600 text-white rounded-lg font-semibold transition-colors"
+              >
+                Browse Products
+              </Link>
+            </div>
+          ) : (
+            <div className="space-y-4">
+              {filteredTransactions.map(txn => (
+                <div
+                  key={txn.id}
+                  className="ui-card bg-surface-elevated rounded-lg shadow-sm border border-border-default p-4 sm:p-5"
+                >
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                    {/* Left side */}
+                    <div className="flex-1 min-w-0">
+                      <div className="flex flex-wrap items-center gap-2 mb-2">
+                        <span
+                          className={`ui-badge inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium ${getStatusColor(txn.status)}`}
+                        >
+                          {getStatusLabel(txn.status)}
+                        </span>
+                        <span className="ui-badge inline-flex items-center px-2.5 py-0.5 rounded-full text-xs font-medium bg-surface-secondary text-foreground-secondary">
+                          {getMethodLabel(txn.paymentMethod, txn.paymentGateway)}
+                        </span>
+                      </div>
+
+                      <div className="flex flex-wrap items-baseline gap-x-4 gap-y-1">
+                        <span className="text-lg font-bold text-foreground">
+                          {txn.amount.toLocaleString('en-IN', { style: 'currency', currency: 'INR' })}
+                        </span>
+                        <Link
+                          href={orderPath(txn.orderId)}
+                          className="text-sm text-accent-600 hover:text-accent-700 dark:text-accent-400 dark:hover:text-accent-300 font-medium"
+                        >
+                          Order #{txn.orderNumber}
+                        </Link>
+                      </div>
+
+                      {txn.transactionId && (
+                        <p className="text-xs text-foreground-muted mt-1 font-mono truncate">
+                          TXN: {txn.transactionId}
+                        </p>
+                      )}
+                    </div>
+
+                    {/* Right side */}
+                    <div className="text-sm text-foreground-muted sm:text-right flex-shrink-0">
+                      <p>
+                        {new Date(txn.createdAt).toLocaleDateString('en-IN', {
+                          day: 'numeric',
+                          month: 'short',
+                          year: 'numeric',
+                        })}
+                      </p>
+                      <p className="text-xs">
+                        {new Date(txn.createdAt).toLocaleTimeString('en-IN', {
+                          hour: '2-digit',
+                          minute: '2-digit',
+                          timeZone: 'Asia/Kolkata',
+                        })}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+              ))}
+
+              <InfiniteFooter shown={transactions.length} control={list} noun="transactions" />
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export function AccountTransactionsVisitor() {
+  return <AccountTransactions isBusiness={false} />
+}
+
+export function AccountTransactionsBusiness() {
+  return <AccountTransactions isBusiness={true} />
+}

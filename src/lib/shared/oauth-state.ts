@@ -1,0 +1,85 @@
+import crypto from 'crypto'
+import { NextResponse } from 'next/server'
+
+// Signed OAuth state for the store-admin connect flows. HMAC-signs a compact JSON payload with
+// CRON_SECRET (a server-only secret) so the callback can trust the tenantId it receives — the
+// browser can't forge or tamper with it, and the nonce makes each flow single-use in practice.
+// Distinct from the ecom owner-console state: here the authz binding is the tenantId (re-checked
+// against the callback's ALS tenant), not an owner id.
+
+export interface AdminOAuthState {
+  tenantId: string
+  provider: string
+  nonce: string
+  spreadsheetId?: string
+  // Tenant's own admin base URL, stamped at connect time (on the tenant host) so the callback —
+  // which always lands on the platform OAuth host with no tenant in context — can return the user
+  // to their own admin instead of the platform's.
+  returnBase?: string
+  // Google Merchant connect: the account id the token is for.
+  merchantId?: string
+  // Google Ads reconnect (to add a scope): keep the chosen account if the new sign-in can reach it.
+  keepAccount?: boolean
+  // Meta: which app opened the dialog (the store's own or the platform's); the code is exchanged with it.
+  metaApp?: 'own' | 'platform'
+  // Issued-at (unix seconds); stamped by signAdminState and checked by verifyAdminState.
+  iat?: number
+}
+
+const MAX_STATE_AGE_SEC = 30 * 60
+
+function key(): string {
+  const k = process.env.CRON_SECRET
+  if (!k) throw new Error('CRON_SECRET not set — required to sign OAuth state')
+  return k
+}
+
+export function signAdminState(s: AdminOAuthState): string {
+  const payload = Buffer.from(JSON.stringify({ iat: Math.floor(Date.now() / 1000), ...s })).toString('base64url')
+  const sig = crypto.createHmac('sha256', key()).update(payload).digest('base64url')
+  return `${payload}.${sig}`
+}
+
+export function verifyAdminState(state: string): AdminOAuthState | null {
+  const [payload, sig] = state.split('.')
+  if (!payload || !sig) return null
+  const expected = crypto.createHmac('sha256', key()).update(payload).digest('base64url')
+  const a = Buffer.from(sig)
+  const b = Buffer.from(expected)
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return null
+  try {
+    const parsed = JSON.parse(Buffer.from(payload, 'base64url').toString('utf8')) as AdminOAuthState
+    if (typeof parsed.iat === 'number' && Date.now() / 1000 - parsed.iat > MAX_STATE_AGE_SEC) return null
+    return parsed
+  } catch {
+    return null
+  }
+}
+
+// The signed state carries a tenant-stamped returnBase, but the callback is cross-site and
+// unauthenticated, so the host is trusted only when it exactly matches the admin host the verified
+// tenantId resolves to on the server. Returns the approved origin, or null to fall back to default.
+export function safeReturnBase(returnBase: string | undefined, expectedAdminBase: string): string | null {
+  if (!returnBase) return null
+  try {
+    const got = new URL(returnBase)
+    const want = new URL(expectedAdminBase)
+    const local = got.hostname === 'localhost' || got.hostname.endsWith('.localhost')
+    if ((got.protocol === 'https:' || (local && got.protocol === 'http:')) && got.host === want.host) return got.origin
+  } catch {}
+  return null
+}
+
+// The admin cookie is SameSite=Strict and withheld for the whole redirect chain that began at the
+// provider, so a plain redirect lands on /login. Navigating from this page makes the last hop same-site.
+export function returnToAdmin(url: string): NextResponse {
+  const attr = url.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+  const js = JSON.stringify(url).replace(/</g, '\\u003c')
+  const html =
+    '<!doctype html><html><head><meta charset="utf-8"><meta name="robots" content="noindex">' +
+    `<meta http-equiv="refresh" content="0;url=${attr}"><title>Returning to admin</title></head>` +
+    `<body><script>location.replace(${js})</script><a href="${attr}">Continue to admin</a></body></html>`
+  return new NextResponse(html, {
+    headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' },
+  })
+}

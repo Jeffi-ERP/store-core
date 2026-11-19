@@ -1,0 +1,312 @@
+'use client'
+
+import { useState } from 'react'
+import { assignableScopes } from '@/lib/auth/scopes'
+import ScopeGrid from '@/components/admin/ScopeGrid'
+import { FormFooter } from '@/components/admin/kit/form'
+
+export default function CreateAdminForm({
+  onCreated,
+  allowedScopeKeys,
+}: {
+  onCreated?: () => void
+  allowedScopeKeys?: string[]
+}) {
+  const [isOpen, setIsOpen] = useState(false)
+  const [loading, setLoading] = useState(false)
+  const [error, setError] = useState('')
+  const [certInfo, setCertInfo] = useState<{
+    p12Password: string | null
+    email: string
+    fullName: string
+    serialNumber: string
+    expiresAt: string
+    emailSent: boolean
+    portalInvite: boolean
+    portalUrl: string
+  } | null>(null)
+
+  const [form, setForm] = useState({
+    email: '',
+    first_name: '',
+    last_name: '',
+    role: 'admin',
+    scopes: [] as string[],
+  })
+
+  function toggleScope(scope: string) {
+    setForm(prev => ({
+      ...prev,
+      scopes: prev.scopes.includes(scope) ? prev.scopes.filter(s => s !== scope) : [...prev.scopes, scope],
+    }))
+  }
+
+  function selectAllScopes() {
+    setForm(prev => ({
+      ...prev,
+      scopes: allowedScopeKeys ?? assignableScopes(false).map(s => s.key),
+    }))
+  }
+
+  function clearAllScopes() {
+    setForm(prev => ({ ...prev, scopes: [] }))
+  }
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    setLoading(true)
+    setError('')
+
+    try {
+      const res = await fetch('/api/admin/users', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(form),
+      })
+
+      const data = await res.json()
+
+      if (!res.ok) {
+        setError(data.error || 'Failed to create admin')
+        return
+      }
+
+      if (data.certificate?.p12Base64) {
+        const binary = atob(data.certificate.p12Base64)
+        const bytes = new Uint8Array(binary.length)
+        for (let i = 0; i < binary.length; i++) {
+          bytes[i] = binary.charCodeAt(i)
+        }
+        const blob = new Blob([bytes], { type: 'application/x-pkcs12' })
+        const url = URL.createObjectURL(blob)
+        const a = document.createElement('a')
+        a.href = url
+        a.download = `${form.email}-admin-cert.p12`
+        document.body.appendChild(a)
+        a.click()
+        document.body.removeChild(a)
+        URL.revokeObjectURL(url)
+      }
+
+      setCertInfo({
+        p12Password: data.certificate?.p12Password ?? null,
+        email: form.email,
+        fullName: `${form.first_name} ${form.last_name}`.trim(),
+        serialNumber: data.certificate?.serialNumber,
+        expiresAt: data.certificate?.expiresAt,
+        emailSent: data.emailSent === true,
+        portalInvite: data.portalInvite === true,
+        portalUrl: data.portalUrl || '',
+      })
+
+      setForm({
+        email: '',
+        first_name: '',
+        last_name: '',
+        role: 'admin',
+        scopes: [],
+      })
+
+      onCreated?.()
+    } catch (err) {
+      setError('Network error. Please try again.')
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  if (certInfo) {
+    return (
+      <div className="bg-green-50 dark:bg-green-900/30 border border-green-200 dark:border-green-800 rounded-lg p-4 sm:p-6">
+        <h3 className="text-lg font-bold text-green-800 dark:text-green-300 mb-4">Admin Created Successfully</h3>
+        <div className="space-y-3">
+          <div>
+            <p className="text-sm text-green-700 dark:text-green-400">Admin</p>
+            <p className="font-mono font-bold text-green-900 dark:text-green-200 [overflow-wrap:anywhere]">
+              {certInfo.fullName || certInfo.email}
+            </p>
+            <p className="text-xs text-green-700 dark:text-green-400 [overflow-wrap:anywhere]">{certInfo.email}</p>
+          </div>
+          {certInfo.p12Password && (
+            <div>
+              <p className="text-sm text-green-700 dark:text-green-400">Certificate Password (one-time view)</p>
+              <p className="font-mono font-bold text-green-900 dark:text-green-200 bg-green-100 dark:bg-green-800/50 px-3 py-2 rounded select-all break-all">
+                {certInfo.p12Password}
+              </p>
+            </div>
+          )}
+          {certInfo.serialNumber && (
+            <div>
+              <p className="text-sm text-green-700 dark:text-green-400">Certificate Serial</p>
+              <p className="font-mono text-xs text-green-800 dark:text-green-300 break-all">{certInfo.serialNumber}</p>
+            </div>
+          )}
+          {certInfo.expiresAt && (
+            <div>
+              <p className="text-sm text-green-700 dark:text-green-400">Expires</p>
+              <p className="text-green-800 dark:text-green-300">
+                {new Date(certInfo.expiresAt).toLocaleDateString('en-IN')}
+              </p>
+            </div>
+          )}
+        </div>
+        {certInfo.portalInvite ? (
+          <p className="text-sm text-green-800 dark:text-green-300 bg-green-100 dark:bg-green-800/40 px-3 py-2 rounded mt-4">
+            An invitation was sent. The admin downloads their certificate once from{' '}
+            <a href={certInfo.portalUrl} className="underline font-medium" target="_blank" rel="noreferrer">
+              {certInfo.portalUrl.replace('https://', '')}
+            </a>{' '}
+            by signing in with this Google account. No certificate file or password is shown here.
+          </p>
+        ) : (
+          <p className="text-sm text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-900/30 px-3 py-2 rounded mt-4">
+            The .p12 certificate file has been downloaded. Save the password above — it will not be shown again.
+            {certInfo.portalUrl && (
+              <>
+                {' '}
+                The admin can also fetch it once from{' '}
+                <a href={certInfo.portalUrl} className="underline font-medium" target="_blank" rel="noreferrer">
+                  {certInfo.portalUrl.replace('https://', '')}
+                </a>
+                .
+              </>
+            )}
+          </p>
+        )}
+        {!certInfo.emailSent && (
+          <div className="flex items-start gap-2 mt-3 px-3 py-2.5 rounded bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800">
+            <svg className="w-4 h-4 text-red-500 shrink-0 mt-0.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M12 9v2m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z"
+              />
+            </svg>
+            <p className="text-xs text-red-700 dark:text-red-300">
+              Email delivery failed — use the <strong>Resend Email</strong> button in the Admin Users table to retry.
+            </p>
+          </div>
+        )}
+        {certInfo.emailSent && (
+          <p className="text-xs text-green-700 dark:text-green-400 mt-2">
+            Certificate emailed to the admin&apos;s address.
+          </p>
+        )}
+        <button
+          type="button"
+          onClick={() => {
+            setCertInfo(null)
+            setIsOpen(false)
+          }}
+          className="mt-4 bg-green-600 hover:bg-green-700 text-white px-4 h-control rounded-lg text-sm font-medium"
+        >
+          Done
+        </button>
+      </div>
+    )
+  }
+
+  if (!isOpen) {
+    return (
+      <button
+        type="button"
+        onClick={() => setIsOpen(true)}
+        className="bg-accent-500 hover:bg-accent-600 text-white px-6 py-3 rounded-lg font-semibold transition-colors"
+      >
+        Create New Admin
+      </button>
+    )
+  }
+
+  return (
+    <form onSubmit={handleSubmit} className="space-y-4">
+      {error && (
+        <div className="bg-red-50 dark:bg-red-900/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-300 px-4 py-3 rounded-lg text-sm">
+          {error}
+        </div>
+      )}
+
+      <div className="grid grid-cols-1 md:grid-cols-2 xl:grid-cols-4 gap-4">
+        <div>
+          <label htmlFor="admin-first-name" className="block text-sm font-medium text-foreground-secondary mb-1">
+            First Name *
+          </label>
+          <input
+            id="admin-first-name"
+            type="text"
+            required
+            value={form.first_name}
+            onChange={e => setForm(prev => ({ ...prev, first_name: e.target.value }))}
+            className="w-full border border-border-secondary rounded-lg px-3 h-control text-sm bg-surface text-foreground placeholder:text-foreground-muted focus:ring-accent-500 focus:border-accent-500"
+          />
+        </div>
+        <div>
+          <label htmlFor="admin-last-name" className="block text-sm font-medium text-foreground-secondary mb-1">
+            Last Name *
+          </label>
+          <input
+            id="admin-last-name"
+            type="text"
+            required
+            value={form.last_name}
+            onChange={e => setForm(prev => ({ ...prev, last_name: e.target.value }))}
+            className="w-full border border-border-secondary rounded-lg px-3 h-control text-sm bg-surface text-foreground placeholder:text-foreground-muted focus:ring-accent-500 focus:border-accent-500"
+          />
+        </div>
+        <div>
+          <label htmlFor="admin-email" className="block text-sm font-medium text-foreground-secondary mb-1">
+            Email *
+          </label>
+          <input
+            id="admin-email"
+            type="email"
+            required
+            value={form.email}
+            onChange={e => setForm(prev => ({ ...prev, email: e.target.value }))}
+            className="w-full border border-border-secondary rounded-lg px-3 h-control text-sm bg-surface text-foreground placeholder:text-foreground-muted focus:ring-accent-500 focus:border-accent-500"
+          />
+        </div>
+
+        <div>
+          <label className="block text-sm font-medium text-foreground-secondary mb-1">Role</label>
+          <div className="flex gap-2">
+            {(['admin', 'moderator'] as const).map(r => (
+              <button
+                key={r}
+                type="button"
+                onClick={() => setForm(prev => ({ ...prev, role: r }))}
+                className={`flex-1 px-3 h-control rounded-lg border text-sm font-medium transition-colors ${
+                  form.role === r
+                    ? 'border-accent-500 bg-accent-500/10 text-accent-600 dark:text-accent-400'
+                    : 'border-border-default bg-surface text-foreground hover:bg-surface-secondary'
+                }`}
+              >
+                <span className="capitalize">{r}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <label className="block text-sm font-medium text-foreground-secondary mb-2">Scopes</label>
+        <ScopeGrid
+          selected={form.scopes}
+          onToggle={toggleScope}
+          onSelectAll={selectAllScopes}
+          onClearAll={clearAllScopes}
+          allowedKeys={allowedScopeKeys}
+        />
+      </div>
+
+      <FormFooter
+        sticky={false}
+        onCancel={() => setIsOpen(false)}
+        submitLabel="Create Admin & Generate Certificate"
+        pending={loading}
+        pendingLabel="Creating..."
+      />
+    </form>
+  )
+}

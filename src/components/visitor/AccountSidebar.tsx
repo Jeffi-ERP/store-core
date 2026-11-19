@@ -1,0 +1,268 @@
+'use client'
+
+import Link from 'next/link'
+import { usePathname } from 'next/navigation'
+import { useAuth } from '@/contexts/AuthContext'
+import { useAccountSearch } from '@/contexts/AccountSearchContext'
+import AccountSearch from '@/components/visitor/AccountSearch'
+import { useLoyaltyEnabled } from '@/hooks/useLoyaltyEnabled'
+import { useReferralEnabled } from '@/hooks/useReferralEnabled'
+import { useStoreConfig } from '@/contexts/StoreConfigContext'
+
+const navItems = [
+  {
+    href: '/account',
+    label: 'Profile',
+    exact: true,
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth={2}
+          d="M16 7a4 4 0 11-8 0 4 4 0 018 0zM12 14a7 7 0 00-7 7h14a7 7 0 00-7-7z"
+        />
+      </svg>
+    ),
+  },
+  {
+    href: '/account/orders',
+    label: 'My Orders',
+    exact: false,
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth={2}
+          d="M16 11V7a4 4 0 00-8 0v4M5 9h14l1 12H4L5 9z"
+        />
+      </svg>
+    ),
+  },
+  {
+    href: '/account/transactions',
+    label: 'Transactions',
+    exact: false,
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth={2}
+          d="M9 14l6-6m-5.5.5h.01m4.99 5h.01M19 21V5a2 2 0 00-2-2H7a2 2 0 00-2 2v16l3.5-2 3.5 2 3.5-2 3.5 2z"
+        />
+      </svg>
+    ),
+  },
+  {
+    href: '/account/addresses',
+    label: 'My Addresses',
+    exact: false,
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth={2}
+          d="M17.657 16.657L13.414 20.9a1.998 1.998 0 01-2.827 0l-4.244-4.243a8 8 0 1111.314 0z"
+        />
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 11a3 3 0 11-6 0 3 3 0 016 0z" />
+      </svg>
+    ),
+  },
+  {
+    href: '/wishlist',
+    label: 'Wishlist',
+    exact: false,
+    icon: (
+      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+        <path
+          strokeLinecap="round"
+          strokeLinejoin="round"
+          strokeWidth={2}
+          d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"
+        />
+      </svg>
+    ),
+  },
+]
+
+const businessNavItem = {
+  href: '/account/quotes',
+  label: 'My Quotes',
+  exact: false,
+  icon: (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth={2}
+        d="M8 7v8a2 2 0 002 2h6M8 7V5a2 2 0 012-2h4.586a1 1 0 01.707.293l4.414 4.414a1 1 0 01.293.707V15a2 2 0 01-2 2h-2M8 7H6a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2v-2"
+      />
+    </svg>
+  ),
+}
+
+const subscriptionsNavItem = {
+  href: '/account/subscriptions',
+  label: 'Subscriptions',
+  exact: false,
+  icon: (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth={2}
+        d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+      />
+    </svg>
+  ),
+}
+
+const rewardsNavItem = {
+  href: '/account/rewards',
+  label: 'Rewards',
+  exact: false,
+  icon: (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth={2}
+        d="M12 8v13m0-13V6a2 2 0 112 2h-2zm0 0V5.5A2.5 2.5 0 109.5 8H12zm-7 4h14M5 12a2 2 0 110-4h14a2 2 0 110 4M5 12v7a2 2 0 002 2h10a2 2 0 002-2v-7"
+      />
+    </svg>
+  ),
+}
+
+const referralsNavItem = {
+  href: '/account/referrals',
+  label: 'Refer & Earn',
+  exact: false,
+  icon: (
+    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+      <path
+        strokeLinecap="round"
+        strokeLinejoin="round"
+        strokeWidth={2}
+        d="M18 9v3m0 0v3m0-3h3m-3 0h-3m-2-5a4 4 0 11-8 0 4 4 0 018 0zM3 20a6 6 0 0112 0v1H3v-1z"
+      />
+    </svg>
+  ),
+}
+
+export { navItems }
+
+export function useAccountNavItems() {
+  const { user } = useAuth()
+  const loyaltyEnabled = useLoyaltyEnabled()
+  const referralEnabled = useReferralEnabled()
+  const subscriptionsEnabled = useStoreConfig().flags.subscriptionsEnabled
+  const base = subscriptionsEnabled ? [...navItems.slice(0, 2), subscriptionsNavItem, ...navItems.slice(2)] : navItems
+  if (!loyaltyEnabled || user?.isBusiness) return base
+  return referralEnabled ? [...base, rewardsNavItem, referralsNavItem] : [...base, rewardsNavItem]
+}
+
+const accountBackLinkMap: Array<{ pattern: RegExp; label: string; href: string }> = [
+  { pattern: /^\/account\/orders\/.+/, label: 'My Orders', href: '/account/orders' },
+  { pattern: /^\/account\/quotes\/.+/, label: 'My Quotes', href: '/account/quotes' },
+]
+
+export function AccountNavBar() {
+  const pathname = usePathname()
+  const { user } = useAuth()
+  const { query, suggestions, placeholder, setQuery } = useAccountSearch()
+  const baseItems = useAccountNavItems()
+  const items = user?.isBusiness && user.approvalStatus === 'approved' ? [...baseItems, businessNavItem] : baseItems
+
+  const activeLabel = (() => {
+    const match = items
+      .slice()
+      .reverse()
+      .find(item => (item.exact ? pathname === item.href : pathname.startsWith(item.href)))
+    return match?.label ?? 'My Account'
+  })()
+
+  const backLink = accountBackLinkMap.find(b => b.pattern.test(pathname))
+
+  return (
+    <div className="account-nav-band hidden lg:block sticky top-0 z-20 bg-surface shadow-sm pt-4">
+      <div className="container mx-auto px-4 py-2">
+        <div className="ui-card bg-surface-elevated rounded-xl border border-border-default px-3 py-1.5 flex items-center gap-3">
+          <span className="account-nav-label text-sm font-semibold text-foreground whitespace-nowrap pl-1 hidden sm:block">
+            {activeLabel}
+          </span>
+          <div className="account-nav-label hidden sm:block w-px h-5 bg-border-default flex-shrink-0" />
+          <nav className="flex items-center gap-1 overflow-x-auto scrollbar-none flex-1">
+            {items.map(item => {
+              const isActive = item.exact ? pathname === item.href : pathname.startsWith(item.href)
+              return (
+                <Link
+                  key={item.href}
+                  href={item.href}
+                  className={`ui-btn flex items-center gap-2 px-3 py-2 rounded-lg text-sm font-medium whitespace-nowrap transition-colors flex-shrink-0 ${
+                    isActive
+                      ? 'bg-accent-50 text-accent-700 dark:bg-accent-900/30 dark:text-accent-400'
+                      : 'text-foreground-secondary hover:bg-surface-secondary hover:text-foreground'
+                  }`}
+                >
+                  {item.icon}
+                  {item.label}
+                </Link>
+              )
+            })}
+          </nav>
+          {backLink && (
+            <Link
+              href={backLink.href}
+              className="ui-btn flex-shrink-0 flex items-center gap-1.5 px-3 py-2 rounded-lg text-sm font-medium text-accent-600 hover:text-accent-700 dark:text-accent-400 dark:hover:text-accent-300 hover:bg-accent-50 dark:hover:bg-accent-900/20 transition-colors whitespace-nowrap"
+            >
+              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
+              </svg>
+              {backLink.label}
+            </Link>
+          )}
+          {(suggestions.length > 0 || placeholder !== 'Search…') && !backLink ? (
+            <div className="hidden sm:block w-52 flex-shrink-0">
+              <AccountSearch placeholder={placeholder} suggestions={suggestions} value={query} onChange={setQuery} />
+            </div>
+          ) : null}
+        </div>
+      </div>
+    </div>
+  )
+}
+
+export default function AccountSidebar() {
+  const pathname = usePathname()
+  const { user } = useAuth()
+  const baseItems = useAccountNavItems()
+  const items = user?.isBusiness && user.approvalStatus === 'approved' ? [...baseItems, businessNavItem] : baseItems
+
+  return (
+    <div className="ui-card bg-surface-elevated rounded-lg shadow-sm border border-border-default p-4">
+      <nav className="space-y-2">
+        {items.map(item => {
+          const isActive = item.exact ? pathname === item.href : pathname.startsWith(item.href)
+
+          return (
+            <Link
+              key={item.href}
+              href={item.href}
+              className={`ui-btn flex items-center gap-3 px-4 py-3 rounded-lg transition-colors ${
+                isActive
+                  ? 'bg-accent-50 text-accent-700 font-medium dark:bg-accent-900/30 dark:text-accent-400'
+                  : 'text-foreground-secondary hover:bg-surface-secondary'
+              }`}
+            >
+              {item.icon}
+              {item.label}
+            </Link>
+          )
+        })}
+      </nav>
+    </div>
+  )
+}

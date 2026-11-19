@@ -1,0 +1,112 @@
+import { createHmac } from 'node:crypto'
+import { resolveTenant } from '@/lib/tenancy/tenant-context'
+import { FLAGSHIP_TENANT_ID } from '@/lib/payments/wallet'
+
+// Server-side access to the messaging-templates library (messaging-service). The flagship store has
+// no tenant context, so it speaks to messaging-service as the platform tenant (whose templates ARE the
+// standard library) — without this, every flagship send/lookup was silently skipped.
+
+const MESSAGING_URL = (process.env.MESSAGING_URL || 'http://localhost:3101').replace(/\/$/, '')
+export type Channel = 'email' | 'sms' | 'whatsapp'
+
+export async function messagingTenant(): Promise<{ tenantId: string; slug: string }> {
+  const t = await resolveTenant()
+  return t ? { tenantId: t.tenantId, slug: t.slug } : { tenantId: FLAGSHIP_TENANT_ID, slug: 'platform' }
+}
+
+// senderTenant: a send as the platform that goes out from that store's numbers. Internal only: it never reaches the
+// public API's request body.
+export function serviceToken(tenantId: string, tenantSlug: string, senderTenant?: string): string {
+  const secret = process.env.SERVICE_AUTH_SECRET
+  if (!secret) throw new Error('SERVICE_AUTH_SECRET is not set')
+  const payload = JSON.stringify({ service: 'platform', internal: true, tenantId, tenantSlug, ...(senderTenant ? { senderTenant } : {}), exp: Math.floor(Date.now() / 1000) + 60 })
+  const sig = createHmac('sha256', secret).update(payload).digest()
+  return `${Buffer.from(payload).toString('base64url')}.${sig.toString('base64url')}`
+}
+
+export interface LibraryTemplate {
+  id: string
+  slug: string
+  name: string
+  channel: Channel
+  category: string | null
+  subject: string | null
+  preheader: string | null
+  body: string
+  blocks: any
+  blocks_format: string | null
+  variables: string[]
+  provider_ref: string | null
+  approval_status: string | null
+  media_type: string | null
+  /** Email: 'none' = send the HTML as written, without the store layout. */
+  layout: 'store' | 'none'
+}
+
+const cache = new Map<string, { at: number; t: LibraryTemplate | null }>()
+const TTL = 60_000
+
+/** The tenant's copy of a template, else the standard one. Cached 60 s per tenant. */
+export async function getLibraryTemplate(channel: Channel, slug: string): Promise<LibraryTemplate | null> {
+  const { tenantId, slug: tenantSlug } = await messagingTenant()
+  const key = `${tenantId}|${channel}|${slug}`
+  const hit = cache.get(key)
+  if (hit && Date.now() - hit.at < TTL) return hit.t
+  let t: LibraryTemplate | null = null
+  try {
+    const r = await fetch(`${MESSAGING_URL}/v2/templates/${channel}/${encodeURIComponent(slug)}`, {
+      headers: { authorization: `Bearer ${serviceToken(tenantId, tenantSlug)}` },
+      cache: 'no-store',
+    })
+    if (r.ok) {
+      const a = await r.json()
+      const v = a.current_version ?? {}
+      t = {
+        id: a.id, slug: a.slug, name: a.name, channel: a.channel, category: a.category ?? null,
+        subject: v.subject ?? null, preheader: v.preheader ?? null, body: v.body ?? '', blocks: v.blocks ?? null, blocks_format: v.blocks_format ?? null,
+        variables: v.variables ?? [], provider_ref: a.provider_ref ?? null, approval_status: a.approval_status ?? null,
+        media_type: a.media_type ?? null, layout: v.layout === 'none' ? 'none' : 'store',
+      }
+    }
+  } catch { /* messaging-service down → caller falls back */ }
+  cache.set(key, { at: Date.now(), t })
+  return t
+}
+
+/** Meta has approved the template. One that isn't goes out as free text, which Meta rejects outside the 24-hour window. */
+export async function whatsappTemplateApproved(slug: string): Promise<boolean> {
+  const t = await getLibraryTemplate('whatsapp', slug)
+  return t?.approval_status === 'approved' && !!t.provider_ref
+}
+
+export interface PageTemplate {
+  slug: string
+  name: string
+  subject: string
+  preheader: string
+  body: string
+  tags: string[]
+  /** 'none': the template carries its own design, sent without the store's header and footer. */
+  layout: 'store' | 'none'
+}
+
+/** The email templates offered on an admin page (tag 'page:order'), the store's copies over the standard ones. */
+export async function listPageTemplates(tag: string): Promise<PageTemplate[]> {
+  const { tenantId, slug: tenantSlug } = await messagingTenant()
+  try {
+    const r = await fetch(`${MESSAGING_URL}/v2/templates?channel=email&tag=${encodeURIComponent(tag)}&with_body=1`, {
+      headers: { authorization: `Bearer ${serviceToken(tenantId, tenantSlug)}` },
+      cache: 'no-store',
+    })
+    if (!r.ok) return []
+    const { items } = await r.json()
+    return (items ?? [])
+      .filter((i: any) => i.status !== 'archived' && i.body)
+      .map((i: any) => ({
+        slug: i.slug, name: i.name, subject: i.subject ?? '', preheader: i.preheader ?? '', body: i.body, tags: i.tags ?? [],
+        layout: i.layout === 'none' ? 'none' : 'store',
+      }))
+  } catch {
+    return []
+  }
+}

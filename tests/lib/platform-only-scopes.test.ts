@@ -1,0 +1,60 @@
+import { describe, it, expect } from 'vitest'
+import { ADMIN_SCOPES, ALL_SCOPE_KEYS, TENANT_SCOPE_KEYS, assignableScopes } from '@/lib/auth/scopes'
+
+const ECOM = [
+  'ecom_customers:read',
+  'ecom_customers:write',
+  'ecom_instances:read',
+  'ecom_billing:read',
+  'ecom_billing:write',
+]
+
+describe('control-plane scopes belong to the platform operator alone', () => {
+  it('marks every Ecom Store scope platformOnly', () => {
+    for (const s of ADMIN_SCOPES.filter(s => s.group === 'Ecom Store')) {
+      expect(s.platformOnly, s.key).toBe(true)
+    }
+  })
+
+  it('covers exactly the known control-plane scopes', () => {
+    const flagged = ADMIN_SCOPES.filter(s => s.platformOnly).map(s => s.key)
+    expect(flagged.sort()).toEqual([...ECOM].sort())
+  })
+
+  it('keeps them out of the tenant grant', () => {
+    for (const key of ECOM) expect(TENANT_SCOPE_KEYS).not.toContain(key)
+    expect(TENANT_SCOPE_KEYS.length).toBe(ALL_SCOPE_KEYS.length - ECOM.length)
+  })
+
+  it('excludes them from the assignable list by default', () => {
+    const keys = assignableScopes(false).map(s => s.key)
+    for (const key of ECOM) expect(keys).not.toContain(key)
+  })
+
+  it('still leaves every non-control-plane scope assignable', () => {
+    const keys = assignableScopes(false).map(s => s.key)
+    expect(keys).toContain('products:read')
+    expect(keys).toContain('settings:write')
+  })
+})
+
+// Live control plane, 2026-09-06: basic 21, growth 48, pro 66, enterprise 72, and no plan at
+// any tier references a control-plane scope. Enterprise equalling TENANT_SCOPE_KEYS is what
+// makes it the ceiling a tenant can hold (grew from 71 with the notifications:read bell scope,
+// then +4 with vault:read/write + subscriptions:read/write, which ship on every plan.
+// (Was 76 before the Replication feature was removed, which dropped replication:read → 75;
+// +2 with templates:read/write, the messaging-templates library sold with Mailer → 77;
+// +2 with google_ads:read/write, Google Ads reporting sold on Growth and up → 79;
+// +1 with google_ads_campaigns:write, campaign management sold on Pro and up → 80;
+// +2 with drive:read/write, the staff Drive, on every plan;
+// +10 with Myntra, AJIO and their Ads pages, sold on Pro and up;
+// +2 with setup_guide:read/write, the setup guide, on every plan.)
+describe('the plan ladder never exceeds what a tenant may hold', () => {
+  it('caps the top tier at the full tenant scope set', () => {
+    expect(TENANT_SCOPE_KEYS.length).toBe(107)
+  })
+
+  it('keeps every control-plane scope out of the tenant set', () => {
+    for (const key of ECOM) expect(TENANT_SCOPE_KEYS).not.toContain(key)
+  })
+})

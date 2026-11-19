@@ -1,0 +1,188 @@
+import { aiChat } from '@/lib/shared/ai-client'
+import { parseAiJson } from '@/lib/auth/ai-scope'
+import { BUILTIN_TEMPLATE_VARIABLES, type TemplateVariableDef } from '@/lib/templates/variables-shared'
+
+// "Enrich with AI" for one form field. Format-aware (plain · subject · label · sms · whatsapp · html,
+// plus image/video generation prompts), keeps every merge variable in place, and can write from
+// scratch when the field is empty.
+
+export type EnrichFormat = 'plain' | 'subject' | 'label' | 'sms' | 'whatsapp' | 'html' | 'image_prompt' | 'video_prompt'
+export const ENRICH_FORMATS: EnrichFormat[] = ['plain', 'subject', 'label', 'sms', 'whatsapp', 'html', 'image_prompt', 'video_prompt']
+
+export interface EnrichInput {
+  store: string // store descriptor for the prompt
+  fieldLabel: string
+  value: string
+  context?: string
+  format?: EnrichFormat
+  variables?: string[] // extra variable names the caller's template fills
+  maxLength?: number
+  write?: boolean // allowed to draft when value is empty
+  builtins?: TemplateVariableDef[] // defaults to BUILTIN_TEMPLATE_VARIABLES
+  broadcast?: boolean // no order context → drop order variables
+}
+
+const TOKEN_RULES = `MERGE VARIABLES — the text may contain tokens like {first_name}, {{store_name}}, numbered WhatsApp slots {{1}} {{2}}, and conditional blocks {#if couponCode}…{/if}. Keep every token EXACTLY as written (same braces, same name, same number) and in a sensible place; never invent new tokens, never write a token's value out, never put a token inside a URL or a button label.`
+
+const FORMAT_RULES: Record<EnrichFormat, string> = {
+  plain: 'Plain text only — no HTML, no markdown.',
+  subject: 'An email subject line: one line, at most 9 words, no trailing punctuation, no ALL CAPS, no emoji unless the current value has one.',
+  label: 'A button label: 1–3 words, at most 25 characters, no punctuation, no emoji.',
+  sms: 'An SMS: plain text, GSM-7 characters only (no emoji, no smart quotes), ideally under 160 characters; keep any URL or {short_url} token.',
+  whatsapp: 'A WhatsApp template body (Meta reviews it): plain text, *bold* _italic_ allowed, under 1024 characters, no URLs in the body, numbered slots {{1}} {{2}}… must all remain in order; {{brand_name}} is the store name and stays on the closing line; friendly but not spammy; no promotional ALL CAPS.',
+  html: 'An email body fragment: valid HTML with inline styles only (no <html>/<head>/<body>/<style>), keep all existing links, images and the call-to-action button markup; paragraphs as <p>, headings as <h2>; do not set text colours or fonts.',
+  image_prompt: 'A prompt for an AI image generator: one paragraph of plain descriptive text (no lists, no quotes, no preamble), roughly 40–120 words. Keep the user\'s subject and intent; spell out the subject and its key details, composition and framing, setting/background, lighting, mood and colour palette, visual style (e.g. product photography, flat illustration), and camera/lens or angle where it suits a photo. No text, words, logos or watermarks in the image unless the user asked for them.',
+  video_prompt: 'A prompt for an AI video generator (a short 4–8 second clip): one paragraph of plain descriptive text (no lists, no quotes, no preamble), roughly 40–100 words. Keep the user\'s subject and intent; describe the subject, the setting, the one main motion or action, camera movement (e.g. slow push-in, orbit, static), lighting, mood and visual style. No on-screen text or logos unless the user asked for them.',
+}
+
+const MEDIA_FORMATS = new Set<EnrichFormat>(['image_prompt', 'video_prompt'])
+
+const PLACEMENT = `WHERE VARIABLES BELONG: a first-name token only in the greeting; {couponCode}/{discountPercent} only inside {#if couponCode}…{/if}; store name/contact tokens in sign-offs and contact lines; date tokens as plain text.`
+
+function buildMediaPromptMessages(i: EnrichInput, format: EnrichFormat) {
+  const empty = !i.value.trim()
+  const system = `You write prompts for generative ${format === 'video_prompt' ? 'video' : 'image'} models for ${i.store}.
+${empty ? 'Write a prompt from the context given.' : 'Rewrite the rough idea into a detailed, production-ready prompt. Do not change what is being depicted.'}
+FORMAT — ${FORMAT_RULES[format]}${i.maxLength ? ` Hard limit: ${i.maxLength} characters.` : ''}
+Do not invent product facts, brand names or claims that are not in the idea or context.
+Return ONLY JSON: {"result":"<prompt>"} — no explanation, no markdown fences.`
+  const user = [
+    i.context ? `Context: ${i.context}` : null,
+    empty ? 'Idea: (empty — write one that suits the context)' : `Idea: ${i.value}`,
+  ].filter(Boolean).join('\n')
+  return [{ role: 'system' as const, content: system }, { role: 'user' as const, content: user }]
+}
+
+export function buildEnrichMessages(i: EnrichInput) {
+  const format = i.format ?? 'plain'
+  if (MEDIA_FORMATS.has(format)) return buildMediaPromptMessages(i, format)
+  const defs = (i.builtins ?? BUILTIN_TEMPLATE_VARIABLES).filter(d => !i.broadcast || d.group !== 'order')
+  const extra = (i.variables ?? []).filter(k => /^[a-zA-Z][a-zA-Z0-9_]{0,40}$/.test(k) && !defs.some(d => d.key === k)).slice(0, 40)
+  const vars = [
+    ...defs.map(d => `  {${d.key}} — ${d.label}${d.description ? `: ${d.description}` : ''}`),
+    ...extra.map(k => `  {${k}} — filled for this message`),
+  ].join('\n')
+  const empty = !i.value.trim()
+  const system = `You are a copywriting assistant for ${i.store}.
+${empty ? 'Write the field from the context given.' : 'Improve the given field value: clearer, more professional, more useful — keep its meaning, facts and length class (brief stays brief).'}
+FORMAT — ${FORMAT_RULES[format]}${i.maxLength ? ` Hard limit: ${i.maxLength} characters.` : ''}
+${TOKEN_RULES}
+${PLACEMENT}
+AVAILABLE VARIABLES (use one instead of writing a value that would differ per customer):
+${vars}
+Do not assume a product category or industry the store has not described. Do not change factual data.
+Return ONLY JSON: {"result":"<text>"} — no explanation, no markdown fences.`
+  const user = [
+    i.context ? `Context: ${i.context}` : null,
+    `Field: ${i.fieldLabel}`,
+    empty ? 'Current value: (empty — write it)' : `Current value: ${i.value}`,
+    empty ? 'Write this field.' : 'Enrich this field value.',
+  ].filter(Boolean).join('\n')
+  return [{ role: 'system' as const, content: system }, { role: 'user' as const, content: user }]
+}
+
+const TOKEN = /\{\{?\s*(#if\s+[a-zA-Z_]\w*|\/if|[a-zA-Z_]\w*|\d+)\s*\}?\}/g
+const tokens = (t: string) => [...t.matchAll(TOKEN)].map(m => ({ raw: m[0], key: m[1].replace(/\s+/g, ' ') }))
+
+/**
+ * Models drift on merge tags (brace style, dropped slots, invented tokens). Put every original token
+ * back in its exact form; report what cannot be repaired so the caller can retry or fail.
+ */
+export function preserveTokens(original: string, result: string, allowed: Set<string>): { text: string; problems: string[] } {
+  const want = tokens(original)
+  let text = result
+  const problems: string[] = []
+  const esc = (x: string) => x.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  // Exact form only: "{x}" inside "{{x}}" does not count.
+  const exact = (raw: string) => new RegExp(`(?<!\\{)${esc(raw)}(?!\\})`).test(text)
+  for (const t of want) {
+    if (exact(t.raw)) continue
+    // Same key, different braces → normalise back.
+    const alt = text.match(new RegExp(`\\{\\{?\\s*${esc(t.key)}\\s*\\}?\\}`))
+    if (alt) text = text.replace(alt[0], t.raw)
+    else problems.push(`missing ${t.raw}`)
+  }
+  // Case-insensitive match: 'ProductName' vs 'product_name' both count as the same key.
+  const wantKeys = new Set(want.map(t => t.key.toLowerCase()))
+  const allowedLc = new Set([...allowed].map(k => k.toLowerCase()))
+  for (const t of tokens(text)) {
+    const lc = t.key.toLowerCase()
+    if (wantKeys.has(lc) || allowedLc.has(lc) || /^(#if|\/if)/.test(t.key)) continue
+    problems.push(`invented ${t.raw}`)
+  }
+  return { text, problems }
+}
+
+/** Extract the "result" string from a model response, forgiving of common formatting slips:
+ *  bare JSON, code-fenced JSON, embedded JSON object, or prose. Returns null when nothing usable. */
+export function extractResult(content: string): string | null {
+  if (!content) return null
+  const tryParse = (s: string): string | null => {
+    const obj = parseAiJson<{ result?: unknown }>(s)
+    if (obj && typeof obj.result === 'string' && obj.result.trim()) return obj.result.trim()
+    return null
+  }
+  // (a) bare parse
+  let r = tryParse(content)
+  if (r) return r
+  // (b) strip markdown code fence, retry
+  const fenced = content.match(/```(?:json|JSON)?\s*([\s\S]*?)\s*```/)
+  if (fenced?.[1]) {
+    r = tryParse(fenced[1])
+    if (r) return r
+  }
+  // (c) greedy {...} match, retry
+  const obj = content.match(/\{[\s\S]*\}/)
+  if (obj) {
+    r = tryParse(obj[0])
+    if (r) return r
+  }
+  // (d) direct-string mode: model answered in prose; use the whole thing (trim fences / quotes / backticks)
+  const bare = content.replace(/^```[a-zA-Z]*\s*|\s*```$/g, '').replace(/^["']|["']$/g, '').trim()
+  return bare || null
+}
+
+/** Runs the model and returns the enriched text (throws with a user-facing message on failure). */
+export async function enrichField(i: EnrichInput): Promise<string> {
+  if (!i.write && i.value.trim().length < 2) throw Object.assign(new Error('Value too short to enrich'), { status: 400 })
+  const allowed = new Set([...(i.builtins ?? BUILTIN_TEMPLATE_VARIABLES).map(d => d.key), ...(i.variables ?? [])])
+  // WhatsApp bodies: only the numbered slots that already exist may be used.
+  if (i.format === 'whatsapp') allowed.clear()
+  const messages = buildEnrichMessages(i)
+  let strict = ''
+  let lastRaw = ''
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const r = await aiChat({
+      feature: 'enrichment',
+      modelHint: 'enrich',
+      jsonMode: true,
+      temperature: i.value.trim() ? 0.3 : 0.6,
+      noCache: true,
+      messages: strict ? [...messages, { role: 'user' as const, content: strict }] : messages,
+    })
+    const raw = extractResult(r.content) ?? ''
+    if (!raw) {
+      strict = 'Return a single JSON object exactly like {"result":"…"}, nothing else — no code fences, no commentary.'
+      continue
+    }
+    lastRaw = raw
+    const { text, problems } = preserveTokens(i.value, raw, allowed)
+    if (!problems.length) return i.maxLength && text.length > i.maxLength ? text.slice(0, i.maxLength) : text
+    strict = `Your previous answer broke the merge-variable rules (${problems.join(', ')}). Rewrite it: keep every original token exactly as written and add no new tokens. Return only {"result":"…"}.`
+  }
+  if (!lastRaw) throw Object.assign(new Error('AI returned an empty result'), { status: 502 })
+  throw Object.assign(new Error('AI kept changing the merge variables — try again or edit by hand'), { status: 502 })
+}
+
+export function parseEnrichBody(body: any) {
+  return {
+    fieldLabel: typeof body?.fieldLabel === 'string' ? body.fieldLabel.slice(0, 120) : 'field',
+    value: typeof body?.value === 'string' ? body.value.slice(0, 20000) : '',
+    context: typeof body?.context === 'string' ? body.context.slice(0, 2000) : undefined,
+    format: ENRICH_FORMATS.includes(body?.format) ? (body.format as EnrichFormat) : 'plain',
+    variables: Array.isArray(body?.variables) ? body.variables.filter((v: unknown) => typeof v === 'string') : [],
+    maxLength: Number.isFinite(Number(body?.maxLength)) && Number(body.maxLength) > 0 ? Math.min(Number(body.maxLength), 20000) : undefined,
+    write: body?.write === true,
+    broadcast: body?.broadcast === true,
+  }
+}

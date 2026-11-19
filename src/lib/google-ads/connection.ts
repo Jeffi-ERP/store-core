@@ -1,0 +1,71 @@
+import { getIntegrationCredential } from '@/lib/tenant-registry'
+import { oauthProviderInfo, type OAuthProviderInfo } from '@/lib/integrations/oauth'
+import { PLATFORM_TENANT_ID } from '@/lib/import/jobs'
+import { loadGoogleServiceAccount } from '@/lib/shared/google-credentials'
+import { GOOGLE_ADS_PROVIDER, googleAdsEnvStatus, type GoogleAdsEnvStatus, type AdsConnectedVia } from './credentials'
+
+export interface AdsConnectionStatus {
+  env: GoogleAdsEnvStatus
+  oauth: OAuthProviderInfo
+  /** The flagship store, which can also use the platform service account. */
+  flagship: boolean
+  /** Flagship only: the service account to add as a user in Google Ads. */
+  serviceAccountEmail: string | null
+  connected: boolean
+  /** Signed in with Google but no account picked yet. */
+  pendingAccount: boolean
+  connectedVia: AdsConnectedVia | null
+  customerId: string | null
+  loginCustomerId: string | null
+  accountName: string | null
+  /** The store's own developer token / OAuth client are saved (never the values). */
+  ownCredentials: { developerToken: boolean; oauthClient: boolean }
+}
+
+function serviceAccountEmail(): string | null {
+  try {
+    return loadGoogleServiceAccount().client_email || null
+  } catch {
+    return null
+  }
+}
+
+/** Non-secret connection state for the Google Ads page (never decrypts the token). */
+export async function getAdsConnectionStatus(tenantKey: string): Promise<AdsConnectionStatus> {
+  const row = await getIntegrationCredential(tenantKey, GOOGLE_ADS_PROVIDER).catch(() => null)
+  const live = !!row && row.status === 'connected'
+  const meta = (live ? row!.meta : null) ?? {}
+  const customerId = meta.customer_id ? String(meta.customer_id) : null
+  const env = googleAdsEnvStatus()
+  const flagship = tenantKey === PLATFORM_TENANT_ID
+  const ownCredentials = { developerToken: meta.own_developer_token === true, oauthClient: meta.own_oauth_client === true }
+  const base = {
+    env,
+    // Sign-in uses the platform OAuth client; the store's own developer token stands in for the platform's.
+    oauth: oauthProviderInfo('google_ads', ownCredentials.developerToken ? ['GOOGLE_ADS_DEVELOPER_TOKEN'] : []),
+    ownCredentials,
+    flagship,
+    serviceAccountEmail: flagship ? serviceAccountEmail() : null,
+    pendingAccount: live && !customerId,
+  }
+  // Flagship with no account stored: its own account through the platform service account, when this
+  // environment has the key. Without it the flagship signs in with Google like a store.
+  if (!customerId && flagship && env.platformCustomerId && base.serviceAccountEmail) {
+    return {
+      ...base,
+      connected: true,
+      connectedVia: 'platform',
+      customerId: env.platformCustomerId,
+      loginCustomerId: env.managerId,
+      accountName: null,
+    }
+  }
+  return {
+    ...base,
+    connected: live && !!customerId,
+    connectedVia: (meta.connected_via as AdsConnectedVia) ?? null,
+    customerId,
+    loginCustomerId: meta.login_customer_id ? String(meta.login_customer_id) : null,
+    accountName: meta.account_name ? String(meta.account_name) : null,
+  }
+}

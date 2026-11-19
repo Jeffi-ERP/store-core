@@ -1,0 +1,377 @@
+import { controlPlanePool } from './shared'
+import { clearTenantCache } from './host-resolution'
+import { getTenant, type UpiMode } from './tenants'
+import { getDraft, reopenDraft } from './kyc'
+import { PLATFORM_TENANT_ID, purgeBlocker } from './purge-rule'
+
+/** Set a tenant's status (e.g. provisioning->active) or instance_state (running/stopped). */
+export async function setTenantStatus(tenantId: string, status: string): Promise<void> {
+  const pool = controlPlanePool()
+  await pool.query(`UPDATE tenants SET status=$1, updated_at=now() WHERE id=$2`, [status, tenantId])
+}
+
+/**
+ * Reconciliation sweep: find tenants marked 'active' whose provisioned DB is gone — a tenant_infra
+ * row with rds_endpoint NULL (what deprovision leaves behind). Flip them to 'suspended' so they stop
+ * being served and surface for operator attention. Tenants with no tenant_infra row at all are not
+ * orphans: the platform tenant lives in the flagship DB and never has one. Returns the affected ids.
+ * Safe + idempotent; run periodically from the provisioning cron worker.
+ */
+export async function reconcileOrphanedTenants(): Promise<string[]> {
+  const pool = controlPlanePool()
+  const res = await pool.query(
+    `UPDATE tenants t SET status='suspended', updated_at=now()
+     WHERE t.status='active' AND 'store' = ANY(t.service_types)
+       AND EXISTS (
+         SELECT 1 FROM tenant_infra i WHERE i.tenant_id = t.id AND i.rds_endpoint IS NULL
+       )
+     RETURNING t.id`
+  )
+  if (res.rowCount && res.rowCount > 0) clearTenantCache()
+  return res.rows.map(r => r.id as string)
+}
+export async function saveLinkedAccountId(tenantId: string, linkedAccountId: string): Promise<void> {
+  const pool = controlPlanePool()
+  await pool.query(`UPDATE tenants SET razorpay_linked_account_id=$1, updated_at=now() WHERE id=$2`, [
+    linkedAccountId,
+    tenantId,
+  ])
+}
+
+/**
+ * Switch a tenant between collecting on its own Razorpay account (skip Route split, zero platform
+ * charges) and the platform account (full Route split). Enabling own-account requires connected
+ * tenant Razorpay credentials — enforced by the caller, not here.
+ */
+export async function setOwnRazorpay(tenantId: string, value: boolean): Promise<void> {
+  const pool = controlPlanePool()
+  await pool.query(`UPDATE tenants SET own_razorpay=$1, updated_at=now() WHERE id=$2`, [value, tenantId])
+}
+
+/**
+ * The platform admin's UPI switch for a store ('auto' | 'off'); the provider itself follows what the store saved.
+ */
+export async function setUpiMode(tenantId: string, mode: UpiMode): Promise<void> {
+  const pool = controlPlanePool()
+  await pool.query(`UPDATE tenants SET upi_mode=$1, updated_at=now() WHERE id=$2`, [mode, tenantId])
+}
+
+/** The platform admin's payment choice at approval: Mandatory (true) or Optional (false). */
+export async function setPaymentRequired(tenantId: string, required: boolean): Promise<void> {
+  const pool = controlPlanePool()
+  await pool.query(`UPDATE tenants SET payment_required=$1, updated_at=now() WHERE id=$2`, [required, tenantId])
+}
+
+/**
+ * Flip whether a tenant ships on their own Delhivery token. Enabling requires a connected Delhivery
+ * token — enforced by the caller (delivery-mode route), not here.
+ */
+export async function setOwnDelhivery(tenantId: string, value: boolean): Promise<void> {
+  const pool = controlPlanePool()
+  await pool.query(`UPDATE tenants SET own_delhivery=$1, updated_at=now() WHERE id=$2`, [value, tenantId])
+}
+
+/**
+ * Copy the Razorpay linked account (acc_xxx) onto the owner-scoped bank row so it survives a
+ * hard tenant purge. tenant_bank_accounts cascades off owners (not tenants), so this value
+ * outlives the tenant DELETE and lets a re-onboarding owner reuse their existing Route account
+ * (Razorpay enforces one linked account per merchant email). Idempotent.
+ */
+export async function persistLinkedAccountToOwnerBank(ownerId: string, linkedAccountId: string): Promise<void> {
+  const pool = controlPlanePool()
+  await pool.query(
+    `UPDATE tenant_bank_accounts SET linked_account_id=$2, updated_at=now()
+     WHERE owner_id=$1 AND linked_account_id IS DISTINCT FROM $2`,
+    [ownerId, linkedAccountId]
+  )
+}
+
+export async function saveSubscriptionId(
+  tenantId: string,
+  subscriptionId: string,
+  billingInterval?: string,
+  checkoutUrl?: string
+): Promise<void> {
+  const pool = controlPlanePool()
+  await pool.query(
+    `UPDATE tenants SET razorpay_subscription_id=$1, subscription_status='created',
+      billing_interval=COALESCE($3, billing_interval),
+      razorpay_checkout_url=COALESCE($4, razorpay_checkout_url),
+      updated_at=now() WHERE id=$2`,
+    [subscriptionId, tenantId, billingInterval ?? null, checkoutUrl ?? null]
+  )
+}
+
+export async function setSubscriptionStatus(
+  tenantId: string,
+  subscriptionStatus: string,
+  tenantStatus?: string
+): Promise<void> {
+  const pool = controlPlanePool()
+  if (tenantStatus) {
+    await pool.query(`UPDATE tenants SET subscription_status=$1, status=$2, updated_at=now() WHERE id=$3`, [
+      subscriptionStatus,
+      tenantStatus,
+      tenantId,
+    ])
+  } else {
+    await pool.query(`UPDATE tenants SET subscription_status=$1, updated_at=now() WHERE id=$2`, [
+      subscriptionStatus,
+      tenantId,
+    ])
+  }
+}
+
+export async function getTenantBySubscriptionId(
+  subscriptionId: string
+): Promise<{ id: string; slug: string; status: string; store_request: string | null } | null> {
+  const pool = controlPlanePool()
+  const r = await pool.query(`SELECT id, slug, status, store_request FROM tenants WHERE razorpay_subscription_id=$1`, [subscriptionId])
+  return r.rows[0] ?? null
+}
+
+export async function updateTenantPlan(
+  tenantId: string,
+  opts: {
+    planSlug: string
+    billingInterval: string
+    newSubscriptionId?: string
+  }
+): Promise<void> {
+  const pool = controlPlanePool()
+  const planRow = await pool.query(`SELECT id FROM plans WHERE slug=$1`, [opts.planSlug])
+  const planId = planRow.rows[0]?.id ?? null
+  await pool.query(
+    `UPDATE tenants SET plan_id=$1, billing_interval=$2,
+      razorpay_subscription_id=COALESCE($3, razorpay_subscription_id),
+      subscription_status=CASE WHEN $3 IS NOT NULL THEN 'created' ELSE subscription_status END,
+      updated_at=now() WHERE id=$4`,
+    [planId, opts.billingInterval, opts.newSubscriptionId ?? null, tenantId]
+  )
+}
+
+/** A downgrade waiting for the paid cycle to end (null clears it). */
+export async function setPendingPlan(tenantId: string, pending: { planSlug: string; billingInterval: string } | null): Promise<void> {
+  await controlPlanePool().query(
+    `UPDATE tenants SET pending_plan_id = (SELECT id FROM plans WHERE slug = $2), pending_billing_interval = $3, updated_at = now() WHERE id = $1`,
+    [tenantId, pending?.planSlug ?? null, pending?.billingInterval ?? null]
+  )
+}
+
+/** Move the store onto its waiting downgrade, if it has one; returns the plan it moved to. */
+export async function applyPendingPlan(tenantId: string): Promise<string | null> {
+  const r = await controlPlanePool().query<{ slug: string }>(
+    `UPDATE tenants t SET plan_id = t.pending_plan_id, billing_interval = COALESCE(t.pending_billing_interval, t.billing_interval),
+            pending_plan_id = NULL, pending_billing_interval = NULL, updated_at = now()
+       FROM plans p WHERE t.id = $1 AND p.id = t.pending_plan_id RETURNING p.slug`,
+    [tenantId]
+  )
+  return r.rows[0]?.slug ?? null
+}
+
+export async function setTenantInstanceState(tenantId: string, state: 'running' | 'stopped' | 'migrating' | 'paused'): Promise<void> {
+  const pool = controlPlanePool()
+  await pool.query(`UPDATE tenants SET instance_state=$1, updated_at=now() WHERE id=$2`, [state, tenantId])
+}
+/** Write resolved infra pointers after provisioning. */
+/**
+ * Record a step outcome that happened outside the provisioning worker — the Route linked
+ * account is created at KYC approval, not by a job. Without this the only trace was a stderr
+ * line, which the next blue-green deploy discarded, so a failure could not be diagnosed after
+ * the fact. Attaches to the tenant's most recent job (job_id is NOT NULL) and never throws.
+ */
+export async function recordTenantStepEvent(
+  tenantId: string,
+  step: string,
+  status: 'ok' | 'error',
+  message: string | null,
+  detail: Record<string, unknown> = {}
+): Promise<void> {
+  try {
+    await controlPlanePool().query(
+      `INSERT INTO provisioning_step_events (job_id, tenant_id, step, status, message, detail)
+       SELECT j.id, $1, $2, $3, $4, $5::jsonb
+         FROM provisioning_jobs j WHERE j.tenant_id = $1
+         ORDER BY j.created_at DESC LIMIT 1`,
+      [tenantId, step, status, message, JSON.stringify(detail)]
+    )
+  } catch {
+    /* a log line must never fail the operation it describes */
+  }
+}
+
+export async function writeTenantInfra(
+  tenantId: string,
+  infra: {
+    rdsEndpoint: string
+    s3Bucket: string
+    rdsDb?: string
+    rdsUser?: string
+    sharedDbHost?: string
+    dbSecretRef?: string
+    iamAuth?: boolean
+  }
+): Promise<void> {
+  const pool = controlPlanePool()
+  // A Starter store has its own database + login on a shared host; a dedicated one the defaults.
+  // Node-mode stores run their own Postgres with password auth: iamAuth=false, db_secret_ref
+  // jeffi/tenant-db/{slug}, rds_user jeffi. Any other kind resets both, so a database that moved off
+  // the server never keeps a stale secret ref.
+  await pool.query(
+    `UPDATE tenant_infra SET rds_endpoint=$1, s3_bucket=$2, rds_db=COALESCE($4, 'jeffi_stores'), rds_user=$5, shared_db_host=$6,
+       iam_auth=COALESCE($7, true), db_secret_ref=$8, updated_at=now() WHERE tenant_id=$3`,
+    [
+      infra.rdsEndpoint,
+      infra.s3Bucket,
+      tenantId,
+      infra.rdsDb ?? null,
+      infra.rdsUser ?? null,
+      infra.sharedDbHost ?? null,
+      infra.iamAuth ?? null,
+      infra.dbSecretRef ?? null,
+    ]
+  )
+}
+
+/** Null the infra pointers after deprovisioning (resources deleted). */
+export async function clearTenantInfra(tenantId: string): Promise<void> {
+  const pool = controlPlanePool()
+  await pool.query(
+    `UPDATE tenant_infra SET rds_endpoint=NULL, rds_user=NULL, rds_db='jeffi_stores', shared_db_host=NULL, iam_auth=true, db_secret_ref=NULL,
+       ec2_instance_id=NULL, ec2_target=NULL, s3_bucket=NULL, updated_at=now() WHERE tenant_id=$1`,
+    [tenantId]
+  )
+  clearTenantCache()
+}
+
+// No tenants FK on these (the flagship writes them under the platform id), so no cascade: purge deletes them.
+const UNCASCADED_TABLES = [
+  'import_jobs',
+  'sheet_product_links',
+  'tenant_social_accounts',
+  'tenant_integration_credentials',
+  'razorpay_subscription_index',
+  'ai_provider_identities',
+  // Its Showcase sites (their enquiries cascade).
+  'showcase_sites',
+]
+
+/**
+ * Permanently purge a dead tenant: preserve the owner's Razorpay linked account, delete both S3 backup
+ * copies, its servers, its database-disk snapshot and password secret, then DELETE the tenant row (with
+ * its rows in UNCASCADED_TABLES; the rest cascade). Cloud cleanup is best-effort; the DELETE is the commit
+ * point. The owners row and the owner-scoped tenant_bank_accounts row are intentionally kept so a
+ * returning owner can reuse their existing Route account. No restore after this.
+ */
+export async function purgeTenant(tenantId: string): Promise<{ ok: boolean; error?: string; deletedBackups?: number }> {
+  if (tenantId === PLATFORM_TENANT_ID) return { ok: false, error: 'The platform cannot be deleted' }
+  const pool = controlPlanePool()
+  const tenant = await getTenant(tenantId)
+  if (!tenant) return { ok: false, error: 'Tenant not found' }
+  const blocked = purgeBlocker(tenant)
+  if (blocked) return { ok: false, error: blocked }
+  const slug = tenant.slug
+  const warn = (what: string) => (e: any) => console.error(`[purge] ${slug}: ${what}: ${e?.message || e}`)
+
+  const ownerRow = await pool
+    .query(`SELECT owner_id FROM owner_tenants WHERE tenant_id=$1 LIMIT 1`, [tenantId])
+    .catch(() => null)
+  const ownerId: string | null = ownerRow?.rows[0]?.owner_id ?? null
+
+  if (ownerId && tenant.razorpay_linked_account_id) {
+    await persistLinkedAccountToOwnerBank(ownerId, tenant.razorpay_linked_account_id)
+  }
+
+  // Delhivery has no delete for a client warehouse — deactivate the pickup address so the purged
+  // store's origin stops being usable. Deprovision already does this; repeated here so a purge of
+  // a tenant deprovisioned before that change (or a partial teardown) still retires it.
+  if (ownerId) {
+    const draft = await getDraft(ownerId).catch(() => null)
+    const pickupName = (draft?.data as any)?.wh?.pickupLocation || tenant.slug
+    const { deactivateDelhiveryPickupLocation } = await import('@/lib/shipping/delhivery')
+    await deactivateDelhiveryPickupLocation(pickupName).catch(() => {})
+  }
+
+  let deletedBackups = 0
+  if (ownerId) {
+    const { deleteTenantBackups } = await import('@/lib/tenancy/tenant-backup-store')
+    const res = await deleteTenantBackups({ ownerId, slug: tenant.slug })
+    deletedBackups = res.deleted
+  }
+  // What a deprovision kept for the owner (database backup, media files, configuration) goes with the store.
+  const { expireTenantArchives } = await import('./archives')
+  await expireTenantArchives({ tenantId }).catch(warn('archive delete'))
+
+  const k8s = await import('@/lib/k8s/tenant-compute')
+  if (k8s.k8sComputeEnabled()) {
+    // The namespace delete hands back its server instances; terminate them (this store's nodes only).
+    const ids = (await k8s.deleteTenantWorkload(slug).catch(warn('workload delete'))) ?? []
+    const { terminateInstance } = await import('@/lib/shared/ec2-client')
+    for (const id of ids) {
+      const out = await k8s.terminateTenantInstance(slug, id, terminateInstance).catch(warn(`terminate ${id}`))
+      if (out === 'refused') console.error(`[purge] ${slug}: refused to terminate ${id}: not this store's node`)
+    }
+    // An on-node database's password (deprovision only scheduled its deletion).
+    const { forceDeleteDbSecret } = await import('@/lib/shared/db-secret')
+    await forceDeleteDbSecret(`jeffi/tenant-db/${slug}`, process.env.AWS_REGION || 'us-east-1').catch(warn('db secret delete'))
+  }
+
+  // The database-disk snapshot a teardown took (cleanupNodeDb).
+  const snaps = await pool
+    .query(
+      `SELECT DISTINCT created_resources->>'dbVolumeSnapshotId' AS id FROM provisioning_jobs
+        WHERE tenant_id=$1 AND created_resources->>'dbVolumeSnapshotId' IS NOT NULL`,
+      [tenantId]
+    )
+    .catch(warn('snapshot lookup'))
+  if (snaps?.rows.length) {
+    const { deleteSnapshot } = await import('@/lib/shared/ec2-client')
+    for (const { id } of snaps.rows) await deleteSnapshot(id).catch(warn(`snapshot ${id} delete`))
+  }
+
+  await pool.query(
+    `WITH ${UNCASCADED_TABLES.map((t, i) => `d${i} AS (DELETE FROM ${t} WHERE tenant_id=$1)`).join(', ')}
+     DELETE FROM tenants WHERE id=$1`,
+    [tenantId]
+  )
+  // Keep the owner's onboarding answers and let them submit again.
+  if (ownerId) await reopenDraft(ownerId).catch(() => {})
+  clearTenantCache()
+  return { ok: true, deletedBackups }
+}
+
+/** Platform-wide infra KV (e.g. the shared pool EC2 instance id/ip). */
+export async function getPlatformInfra(key: string): Promise<string | null> {
+  const pool = controlPlanePool()
+  const r = await pool.query(`SELECT value FROM platform_infra WHERE key=$1`, [key])
+  return r.rows[0]?.value ?? null
+}
+
+export async function setPlatformInfra(key: string, value: string | null): Promise<void> {
+  const pool = controlPlanePool()
+  await pool.query(
+    `INSERT INTO platform_infra (key, value) VALUES ($1, $2)
+     ON CONFLICT (key) DO UPDATE SET value=EXCLUDED.value, updated_at=now()`,
+    [key, value]
+  )
+}
+
+/** Persist a tenant's serving EC2 target (dedicated instance IP or pool IP) + optional instance id. */
+export async function writeTenantEc2(
+  tenantId: string,
+  ec2Target: string,
+  ec2InstanceId?: string | null
+): Promise<void> {
+  const pool = controlPlanePool()
+  await pool.query(
+    `UPDATE tenant_infra SET ec2_target=$1, ec2_instance_id=COALESCE($2, ec2_instance_id), updated_at=now() WHERE tenant_id=$3`,
+    [ec2Target, ec2InstanceId ?? null, tenantId]
+  )
+}
+
+/** Drop the tenant's dedicated instance id (plan downgrade back to shared compute). */
+export async function clearTenantEc2Instance(tenantId: string): Promise<void> {
+  await controlPlanePool().query(`UPDATE tenant_infra SET ec2_instance_id=NULL, updated_at=now() WHERE tenant_id=$1`, [
+    tenantId,
+  ])
+}

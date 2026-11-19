@@ -1,0 +1,15 @@
+'use client'
+
+import BatchSerialLabelPicker from '@/components/admin/BatchSerialLabelPicker'
+import { LABEL_SIZES, type LabelSpec } from '@/lib/documents/label-sizes'
+
+// Inline (Labels page tab) wrapper around the shared batch/serial label picker.
+export default function BatchSerialLabels({
+  mode,
+  labelSizes,
+}: {
+  mode: 'batch' | 'serial'
+  labelSizes?: LabelSpec[]
+}) {
+  return <BatchSerialLabelPicker mode={mode} labelSizes={labelSizes ?? LABEL_SIZES} />
+}

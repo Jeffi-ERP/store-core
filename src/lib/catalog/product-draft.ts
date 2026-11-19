@@ -1,0 +1,1831 @@
+import { queryOne, queryMany, withTransaction, query } from '@/lib/shared/db'
+import { recomputeStockStatusForProduct } from '@/lib/orders/inventory'
+import { assertUnitChangeAllowed, changedUnitFields } from '@/lib/catalog/selling-unit'
+import { normalizeDigitalProduct } from '@/lib/catalog/digital-units'
+import { normalizeSubscriptionPrice, normalizeSubscriptionPrices } from '@/lib/subscriptions/sellable'
+import { cycleLimitsError, normalizeCycleCount } from '@/lib/subscriptions/intervals'
+import { generateVariantSku } from '@/lib/catalog/sku'
+import { purgeVariantRows, type PurgeResult } from '@/lib/catalog/variant-purge'
+import {
+  duplicateSkuError,
+  friendlyProductDbError,
+  ProductValidationError,
+  skuConflictError,
+  uniqueProductSlug,
+} from '@/lib/catalog/product-validation'
+import { announceDraftClosed, assertDraftHolder, closeDraftLockTx, isDraftLockError, type DraftActor, type DraftDb } from '@/lib/admin/draft-locks'
+import type { Resolution } from '@/lib/admin/draft-merge'
+import { currentRevision, recordRevision } from '@/lib/admin/entity-revisions'
+import { notifyDraftSiblings } from '@/lib/admin/draft-branches'
+import { extraFieldsSetSql, normalizeExtraFields } from './product-extra-fields'
+import { applyProductFaqsTx, applyProductMediaTx, syncLegacyImagesToMedia } from './product-media'
+import { liveProductSnapshot, mergeProductDraft, type ProductSnapshot } from './product-draft-merge'
+import { applyDraftFileOpsTx, releaseFileObjects } from '@/lib/vault/files'
+
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/**
+ * Returns the order numbers of any OPEN orders (status pending/confirmed) that
+ * reference this product. Publishing a draft can remove variants/sub-variants or
+ * rename SKUs, which forks variant rows and diverges an open order's committed
+ * stock (deduction/restore resolve by FK id, publish merges by SKU). We therefore
+ * block publish while such orders exist. `confirmed` has not yet deducted stock,
+ * `pending` is pre-confirmation — both are still fully mutable and must be safe.
+ */
+export async function openOrdersForProduct(productId: string): Promise<string[]> {
+  const rows = await queryMany<{ order_number: string }>(
+    `SELECT DISTINCT o.order_number
+       FROM order_items oi
+       JOIN orders o ON o.id = oi.order_id
+      WHERE oi.product_id = $1
+        AND o.status IN ('pending', 'confirmed')
+      ORDER BY o.order_number`,
+    [productId]
+  )
+  return rows.map(r => r.order_number)
+}
+
+/** Thrown by publishProductDraft when open orders block the publish. */
+export class OpenOrdersBlockError extends Error {
+  orderNumbers: string[]
+  constructor(orderNumbers: string[]) {
+    super(
+      `Cannot publish: this product has ${orderNumbers.length} open order(s) (${orderNumbers.join(', ')}) in pending/confirmed status. ` +
+        `Publishing could change variants/SKUs and break those orders' stock. Move them past 'confirmed' (or cancel) first.`
+    )
+    this.name = 'OpenOrdersBlockError'
+    this.orderNumbers = orderNumbers
+  }
+}
+
+/** Thrown by publishProductDraft when a selling-unit change is blocked by existing stock. */
+export class UnitChangeBlockedError extends Error {
+  constructor(reason: string) {
+    super(reason)
+    this.name = 'UnitChangeBlockedError'
+  }
+}
+
+/**
+ * Guard every staged base selling-unit change against stock recorded under the
+ * current unit, at each grain (product, variant, sub-variant), honoring
+ * inheritance. Runs BEFORE the publish transaction; throws UnitChangeBlockedError
+ * on the first refusal so nothing is written. A base-unit switch (different unit
+ * name) reads as a factor/dimension/qty_step change vs the old base and is caught;
+ * a re-save with identical numerics is not a change and passes.
+ */
+async function assertStagedUnitChangesAllowed(productId: string, units: any[]): Promise<void> {
+  const baseOf = (rows: any[]) => rows.find(u => u.is_base) ?? null
+
+  const productBase = baseOf(
+    units.filter(
+      u =>
+        !u._cleared && (!u.variant_id || u.variant_id === 'null') && (!u.sub_variant_id || u.sub_variant_id === 'null')
+    )
+  )
+  const variantBases = new Map<string, any>()
+  const subVariantBases = new Map<string, any>()
+  for (const u of units) {
+    if (u._cleared) continue
+    if (u.sub_variant_id && u.sub_variant_id !== 'null') {
+      if (u.is_base && !subVariantBases.has(u.sub_variant_id)) subVariantBases.set(u.sub_variant_id, u)
+    } else if (u.variant_id && u.variant_id !== 'null') {
+      if (u.is_base && !variantBases.has(u.variant_id)) variantBases.set(u.variant_id, u)
+    }
+  }
+
+  const guard = async (scope: { variantId: string | null; subVariantId: string | null }, staged: any) => {
+    if (!staged) return
+    // An admin-confirmed override wipes this grain's stock on publish, so the change
+    // is allowed — the wipe (which runs first, inside the tx) leaves nothing to block.
+    if (staged._reset_stock_on_publish) return
+    const live = await queryOne<{
+      unit: string
+      factor: string
+      dimension: string
+      qty_step: string
+      display_label: string | null
+    }>(
+      `SELECT unit, factor::text, dimension, qty_step::text, display_label
+         FROM product_units
+        WHERE product_id = $1 AND is_base = true
+          AND variant_id IS NOT DISTINCT FROM $2::uuid
+          AND sub_variant_id IS NOT DISTINCT FROM $3::uuid
+        LIMIT 1`,
+      [productId, scope.variantId, scope.subVariantId]
+    )
+    if (!live) return
+    const reason = await assertUnitChangeAllowed(
+      { query },
+      {
+        productId,
+        variantId: scope.variantId,
+        subVariantId: scope.subVariantId,
+        label: live.display_label || live.unit,
+      },
+      changedUnitFields({ factor: staged.factor, dimension: staged.dimension, qty_step: staged.qty_step }, live)
+    )
+    if (reason) throw new UnitChangeBlockedError(reason)
+  }
+
+  await guard({ variantId: null, subVariantId: null }, productBase)
+  for (const [vid, staged] of variantBases) await guard({ variantId: vid, subVariantId: null }, staged)
+  for (const [svid, staged] of subVariantBases) await guard({ variantId: null, subVariantId: svid }, staged)
+}
+
+/**
+ * Scopes whose staged base unit (or cleared-base sentinel) carries an
+ * admin-confirmed `_reset_stock_on_publish` override.
+ */
+function scopesToWipe(units: any[]): { variantId: string | null; subVariantId: string | null }[] {
+  const out: { variantId: string | null; subVariantId: string | null }[] = []
+  const seen = new Set<string>()
+  for (const u of units) {
+    if (!u._reset_stock_on_publish) continue
+    if (!u.is_base && !u._cleared) continue
+    const variantId = u.variant_id && u.variant_id !== 'null' ? u.variant_id : null
+    const subVariantId = u.sub_variant_id && u.sub_variant_id !== 'null' ? u.sub_variant_id : null
+    const key = `${variantId}|${subVariantId}`
+    if (seen.has(key)) continue
+    seen.add(key)
+    out.push({ variantId, subVariantId })
+  }
+  return out
+}
+
+/**
+ * Wipe live stock at an overridden grain PLUS every child that inherits its unit
+ * (a child with no own base unit). In-stock only: sold/reserved serials are kept
+ * (FK-referenced by orders). Runs inside the publish tx, before the unit upserts.
+ */
+async function wipeStockForScope(
+  client: { query: (t: string, p?: unknown[]) => Promise<{ rows: any[] }> },
+  productId: string,
+  scope: { variantId: string | null; subVariantId: string | null }
+): Promise<void> {
+  const { variantId, subVariantId } = scope
+
+  if (subVariantId) {
+    // Leaf grain — just this sub-variant.
+    await client.query(
+      `DELETE FROM product_serials WHERE product_id = $1 AND sub_variant_id = $2 AND status = 'in_stock'`,
+      [productId, subVariantId]
+    )
+    await client.query(`DELETE FROM product_batches WHERE product_id = $1 AND sub_variant_id = $2`, [
+      productId,
+      subVariantId,
+    ])
+    await client.query(`DELETE FROM shelf_stock WHERE product_id = $1 AND sub_variant_id = $2`, [
+      productId,
+      subVariantId,
+    ])
+    await client.query(
+      `UPDATE product_sub_variants SET inventory_quantity = 0, stock_status = 'Out of Stock', updated_at = NOW() WHERE id = $1`,
+      [subVariantId]
+    )
+    return
+  }
+
+  if (variantId) {
+    // Variant grain + its sub-variants that inherit (no own base unit).
+    await client.query(
+      `DELETE FROM product_serials s WHERE s.product_id = $1 AND s.variant_id = $2 AND s.status = 'in_stock'
+         AND (s.sub_variant_id IS NULL OR NOT EXISTS (
+           SELECT 1 FROM product_units pu WHERE pu.sub_variant_id = s.sub_variant_id AND pu.is_base = true))`,
+      [productId, variantId]
+    )
+    await client.query(
+      `DELETE FROM product_batches b WHERE b.product_id = $1 AND b.variant_id = $2
+         AND (b.sub_variant_id IS NULL OR NOT EXISTS (
+           SELECT 1 FROM product_units pu WHERE pu.sub_variant_id = b.sub_variant_id AND pu.is_base = true))`,
+      [productId, variantId]
+    )
+    await client.query(
+      `DELETE FROM shelf_stock sh WHERE sh.product_id = $1 AND sh.variant_id = $2
+         AND (sh.sub_variant_id IS NULL OR NOT EXISTS (
+           SELECT 1 FROM product_units pu WHERE pu.sub_variant_id = sh.sub_variant_id AND pu.is_base = true))`,
+      [productId, variantId]
+    )
+    await client.query(
+      `UPDATE product_sub_variants sv SET inventory_quantity = 0, stock_status = 'Out of Stock', updated_at = NOW()
+        WHERE sv.variant_id = $1
+          AND NOT EXISTS (SELECT 1 FROM product_units pu WHERE pu.sub_variant_id = sv.id AND pu.is_base = true)`,
+      [variantId]
+    )
+    await client.query(
+      `UPDATE product_variants SET inventory_quantity = 0, stock_status = 'Out of Stock', updated_at = NOW() WHERE id = $1`,
+      [variantId]
+    )
+    return
+  }
+
+  // Product grain + all variants/sub-variants that inherit (no own base unit).
+  await client.query(
+    `DELETE FROM product_serials s WHERE s.product_id = $1 AND s.status = 'in_stock'
+       AND NOT EXISTS (SELECT 1 FROM product_units pu WHERE pu.is_base = true
+         AND (pu.variant_id IS NOT DISTINCT FROM s.variant_id) AND (pu.sub_variant_id IS NOT DISTINCT FROM s.sub_variant_id)
+         AND (pu.variant_id IS NOT NULL OR pu.sub_variant_id IS NOT NULL))`,
+    [productId]
+  )
+  await client.query(
+    `DELETE FROM product_batches b WHERE b.product_id = $1
+       AND NOT EXISTS (SELECT 1 FROM product_units pu WHERE pu.is_base = true
+         AND (pu.variant_id IS NOT DISTINCT FROM b.variant_id) AND (pu.sub_variant_id IS NOT DISTINCT FROM b.sub_variant_id)
+         AND (pu.variant_id IS NOT NULL OR pu.sub_variant_id IS NOT NULL))`,
+    [productId]
+  )
+  await client.query(
+    `DELETE FROM shelf_stock sh WHERE sh.product_id = $1
+       AND NOT EXISTS (SELECT 1 FROM product_units pu WHERE pu.is_base = true
+         AND (pu.variant_id IS NOT DISTINCT FROM sh.variant_id) AND (pu.sub_variant_id IS NOT DISTINCT FROM sh.sub_variant_id)
+         AND (pu.variant_id IS NOT NULL OR pu.sub_variant_id IS NOT NULL))`,
+    [productId]
+  )
+  await client.query(
+    `UPDATE product_sub_variants sv SET inventory_quantity = 0, stock_status = 'Out of Stock', updated_at = NOW()
+       FROM product_variants v
+      WHERE sv.variant_id = v.id AND v.product_id = $1
+        AND NOT EXISTS (SELECT 1 FROM product_units pu WHERE pu.is_base = true AND (pu.variant_id = sv.variant_id OR pu.sub_variant_id = sv.id))`,
+    [productId]
+  )
+  await client.query(
+    `UPDATE product_variants v SET inventory_quantity = 0, stock_status = 'Out of Stock', updated_at = NOW()
+      WHERE v.product_id = $1
+        AND NOT EXISTS (SELECT 1 FROM product_units pu WHERE pu.is_base = true AND pu.variant_id = v.id)`,
+    [productId]
+  )
+  await client.query(
+    `UPDATE products SET inventory_quantity = 0, stock_status = 'Out of Stock', updated_at = NOW() WHERE id = $1`,
+    [productId]
+  )
+}
+
+interface ProductDraft {
+  id: string
+  product_id: string
+  title?: string | null
+  base?: ProductSnapshot | null
+  base_revision?: number | null
+  fields: Record<string, unknown>
+  variants: Record<string, unknown>[]
+  images: Record<string, unknown>[]
+  sub_variants: Record<string, unknown>[]
+  units: Record<string, unknown>[]
+  variant_images: Record<string, unknown>[]
+}
+
+/**
+ * Atomically applies a product_drafts row onto the live products row,
+ * replaces all related data (variants, images, sub_variants, units),
+ * then deletes the draft. Called from both the API route and the
+ * server action so the publish logic is never duplicated or bypassed.
+ * With an `actor` the draft lock is asserted and closed inside the same transaction
+ * (system callers such as the importer pass none).
+ */
+export interface PublishProductOpts {
+  activate?: boolean
+  actor?: DraftActor
+  epoch?: number | null
+  /** The draft to publish; without it, the product's newest draft (system callers). */
+  draftId?: string | null
+  /** Picks for fields that live changed too (merge dialog): path -> mine | theirs | { value }. */
+  resolutions?: Record<string, Resolution>
+}
+
+/**
+ * A staged row laid over its live row: keys the draft does not carry keep the live value,
+ * and an empty string over a live NULL stays NULL. An explicit null still clears.
+ */
+function overLive<T extends Record<string, any>>(live: Record<string, any> | null | undefined, staged: T): T {
+  if (!live) return staged
+  const out: Record<string, any> = { ...live, ...staged }
+  for (const [k, v] of Object.entries(staged)) if (v === '' && live[k] == null) out[k] = null
+  return out as T
+}
+
+const UUID_SQL = `'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'`
+
+/** A staged `_media` / `_faqs` value: the form posts it as a JSON string. */
+function parseStaged(v: unknown): any {
+  if (typeof v !== 'string') return v ?? null
+  try {
+    return JSON.parse(v)
+  } catch {
+    return null
+  }
+}
+
+/** Live moved between the merge and the write lock: merge again. */
+class StaleMergeError extends Error {}
+
+export async function publishProductDraft(productId: string, opts: PublishProductOpts = {}): Promise<{ keptForHistory: PurgeResult['deactivated'] }> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return await publishProductDraftOnce(productId, opts)
+    } catch (err) {
+      if (!(err instanceof StaleMergeError) || attempt >= 2) throw err
+    }
+  }
+}
+
+async function publishProductDraftOnce(productId: string, opts: PublishProductOpts): Promise<{ keptForHistory: PurgeResult['deactivated'] }> {
+  const draft = opts.draftId
+    ? await queryOne<ProductDraft>(`SELECT * FROM product_drafts WHERE id = $1 AND product_id = $2`, [opts.draftId, productId])
+    : await queryOne<ProductDraft>(`SELECT * FROM product_drafts WHERE product_id = $1 ORDER BY updated_at DESC LIMIT 1`, [productId])
+  if (!draft) throw new Error('Draft not found')
+  const draftId = draft.id
+
+  // Three-way merge against the newest live (docs/plans/MULTI_DRAFT_PLAN.md): fields this draft
+  // never touched keep what others published since; overlaps throw DraftConflictError.
+  const poolDb: DraftDb = { query: (t, p) => query(t, p) }
+  const [liveSnap, liveRevision] = await Promise.all([liveProductSnapshot(poolDb, productId), currentRevision(poolDb, 'product', productId)])
+  const merge = liveSnap ? await mergeProductDraft(poolDb, draft, liveSnap, opts.resolutions) : null
+  if (merge) Object.assign(draft, merge.merged)
+  // The form replaces `fields` with what it edits; everything else publishes unchanged.
+  if (liveSnap) draft.fields = overLive(liveSnap.fields, draft.fields || {})
+
+  // Hard gate: never publish while the product has open (pending/confirmed) orders.
+  // This is the last line of defence — callers surface a friendlier message first.
+  const blockingOrders = await openOrdersForProduct(productId)
+  if (blockingOrders.length > 0) throw new OpenOrdersBlockError(blockingOrders)
+
+  // Capture the LIVE tracking flags before publishing so we can detect a toggle
+  // from ON→OFF and clean up the now-orphaned batch/serial/shelf records below.
+  const liveFlags = await queryOne<{ perishable: boolean; serialized: boolean; has_variants: boolean; sku: string }>(
+    `SELECT perishable, serialized, has_variants, sku FROM products WHERE id = $1`,
+    [productId]
+  )
+  // Leaf structure BEFORE publish; compared with the post-upsert state below.
+  const liveActiveVariants =
+    (await queryMany<{ id: string; has_subs: boolean }>(
+      `SELECT v.id, EXISTS (SELECT 1 FROM product_sub_variants sv
+                          WHERE sv.variant_id = v.id AND sv.is_active = true) AS has_subs
+       FROM product_variants v WHERE v.product_id = $1 AND v.is_active = true`,
+      [productId]
+    )) || []
+  const liveActiveSubVariants =
+    (await queryMany<{ id: string; variant_id: string }>(
+      `SELECT sv.id, sv.variant_id FROM product_sub_variants sv
+       JOIN product_variants v ON v.id = sv.variant_id
+      WHERE v.product_id = $1 AND v.is_active = true AND sv.is_active = true`,
+      [productId]
+    )) || []
+  // Every live variant (inactive too): is_active fallback for old draft rows, and toggle-off intent.
+  const liveVariantRows =
+    (await queryMany<{ id: string; sku: string; is_active: boolean; subs_on: boolean } & Record<string, any>>(
+      `SELECT v.*,
+              (v.sub_variant_type_on OR EXISTS (SELECT 1 FROM product_sub_variants sv
+                 WHERE sv.variant_id = v.id AND sv.is_active = true)) AS subs_on
+         FROM product_variants v WHERE v.product_id = $1`,
+      [productId]
+    )) || []
+  const liveVariantById = new Map(liveVariantRows.map(v => [v.id, v]))
+  const liveVariantBySku = new Map(liveVariantRows.map(v => [v.sku, v]))
+  const fields: any = draft.fields || {}
+  const newDigital = fields.is_digital === true || fields.is_digital === 'true'
+  const newPerishable = !newDigital && (fields.perishable === true || fields.perishable === 'true')
+  const newSerialized = !newDigital && (fields.serialized === true || fields.serialized === 'true')
+  const newHasVariants = !newDigital && (fields.has_variants === true || fields.has_variants === 'true')
+  const totalCycles = normalizeCycleCount(fields.subscription_total_cycles)
+  const minCycles = normalizeCycleCount(fields.subscription_min_cycles)
+  const cyclesError = cycleLimitsError(totalCycles, minCycles)
+  if (cyclesError) throw new Error(cyclesError)
+  const turnedOffPerishable = !!liveFlags?.perishable && !newPerishable
+  const turnedOffSerialized = !!liveFlags?.serialized && !newSerialized
+  // Product changed from variant-based → simple. Its old variants/sub-variants (and
+  // their orphaned batches/serials/shelf) must be cleaned up; and we must NOT let the
+  // live-data fallback below re-activate them.
+  const turnedOffVariants = !newHasVariants && !!liveFlags?.has_variants
+  // Variants are off for this publish (the draft may still hold them for a later toggle-on).
+  const variantsOff = turnedOffVariants || fields.has_variants === false || fields.has_variants === 'false'
+
+  // If draft variants/sub_variants are empty, fall back to live data — UNLESS the
+  // product just became simple (then there are no intended variants; keep it empty
+  // so the upsert doesn't re-persist/re-activate the old ones).
+  // A cleared SKU keeps the live one; a named variant without a SKU gets the generated one
+  // (the upsert below skips SKU-less variants, which would silently drop them).
+  const productSku = String(fields.sku ?? '').trim() || liveFlags?.sku || ''
+  const fillSku = (v: any) =>
+    !String(v?.sku ?? '').trim() && String(v?.variant_name ?? '').trim() && productSku
+      ? { ...v, sku: generateVariantSku(productSku, String(v.variant_name)) }
+      : v
+  // A draft row without is_active (older drafts, form snapshots) keeps the live row's status.
+  const keepLiveStatus = (v: any) => {
+    if (v?.is_active === true || v?.is_active === false) return v
+    const live = (v?.id && liveVariantById.get(v.id)) || null
+    return live ? { ...v, is_active: live.is_active } : v
+  }
+  // Columns the editor's variant row does not carry (cost, attributes, …) keep their live value.
+  // The sub-variant flag is left as staged: only a literal false retires sub-variants.
+  const keepLiveColumns = (v: any) => {
+    const live = (v?.id && liveVariantById.get(v.id)) || (v?.sku && liveVariantBySku.get(v.sku)) || null
+    if (!live) return v
+    const { subs_on: _s, sub_variant_type_on: _f, ...cols } = live
+    return overLive(cols, v)
+  }
+  // has_variants off: the draft keeps its variants (toggle back on restores them) but none are published.
+  const variants = variantsOff
+    ? []
+    : Array.isArray(draft.variants) && draft.variants.length > 0
+      ? draft.variants.map(fillSku).map(keepLiveStatus).map(keepLiveColumns)
+      : await queryMany(`SELECT * FROM product_variants WHERE product_id = $1`, [productId])
+
+  const subVariants =
+    Array.isArray(draft.sub_variants) && draft.sub_variants.length > 0
+      ? draft.sub_variants
+      : await queryMany(`SELECT * FROM product_sub_variants WHERE product_id = $1`, [productId])
+
+  const units = newDigital
+    ? []
+    : Array.isArray(draft.units) && draft.units.length > 0
+      ? draft.units
+      : await queryMany(`SELECT * FROM product_units WHERE product_id = $1`, [productId])
+
+  // Block a base selling-unit change (or switch) at any grain when stock recorded
+  // under the current unit would be reinterpreted. Runs before the write tx.
+  await assertStagedUnitChangesAllowed(productId, units as any[])
+
+  // SKU / slug clashes with other products surface as clear messages before anything is written.
+  // (The variant upsert is ON CONFLICT (sku) — an unchecked clash would rewrite another product's row.)
+  const draftVariantSkus = (variants as any[])
+    .filter(v => v?.sku && v.is_active !== false)
+    .map(v => ({ label: String(v.variant_name || v.sku), sku: String(v.sku) }))
+  const dupErr = duplicateSkuError(draftVariantSkus)
+  if (dupErr) throw new ProductValidationError(dupErr)
+  const subSkus = (subVariants as any[]).filter(sv => sv?.sku && !sv._cleared).map(sv => String(sv.sku))
+  const conflict = await skuConflictError(
+    { query },
+    { productSku, variantSkus: [...draftVariantSkus.map(v => v.sku), ...subSkus], productId }
+  )
+  if (conflict) throw new ProductValidationError(conflict)
+  // Only a staged slug is de-duplicated; no slug in the draft keeps the live one.
+  const slug = fields.slug ? await uniqueProductSlug({ query }, String(fields.slug), productId) : ''
+
+  const purged: PurgeResult[] = []
+  let closed: Awaited<ReturnType<typeof closeDraftLockTx>> = null
+  let revision: number | null = null
+  let siblings: { id: string; author_admin_id: string | null }[] = []
+  let removedFiles: { storage_key: string; size_bytes: string }[] = []
+  await withTransaction(async client => {
+    await assertDraftHolder(client, opts.actor, 'product', draftId, { epoch: opts.epoch })
+    await client.query(`SELECT 1 FROM products WHERE id = $1 FOR UPDATE`, [productId])
+    if (merge && (await currentRevision(client as unknown as DraftDb, 'product', productId)) !== liveRevision) throw new StaleMergeError()
+    await client.query(
+      `UPDATE products SET
+         category_id              = NULLIF(($2::jsonb)->>'category_id', '')::uuid,
+         brand_id                 = NULLIF(($2::jsonb)->>'brand_id', '')::uuid,
+         sku                      = COALESCE(NULLIF(($2::jsonb)->>'sku', ''), sku),
+         name                     = ($2::jsonb)->>'name',
+         slug                     = COALESCE(NULLIF(($2::jsonb)->>'slug', ''), slug),
+         description              = ($2::jsonb)->>'description',
+         short_description        = ($2::jsonb)->>'short_description',
+         base_price               = COALESCE(NULLIF(($2::jsonb)->>'base_price', '')::numeric, 0),
+         price_ex_gst             = NULLIF(($2::jsonb)->>'price_ex_gst', '')::numeric,
+         currency                 = ($2::jsonb)->>'currency',
+         weight                   = NULLIF(($2::jsonb)->>'weight', '')::numeric,
+         dimensions               = ($2::jsonb)->>'dimensions',
+         material                 = ($2::jsonb)->>'material',
+         finish                   = ($2::jsonb)->>'finish',
+         size                     = ($2::jsonb)->>'size',
+         is_featured              = (($2::jsonb)->>'is_featured')::boolean,
+         mrp                      = NULLIF(($2::jsonb)->>'mrp', '')::numeric,
+         gst_percentage           = NULLIF(($2::jsonb)->>'gst_percentage', '')::numeric,
+         hsn_code                 = ($2::jsonb)->>'hsn_code',
+         has_variants             = (($2::jsonb)->>'has_variants')::boolean,
+         variant_type             = ($2::jsonb)->>'variant_type',
+         mpn                      = ($2::jsonb)->>'mpn',
+         gtin                     = ($2::jsonb)->>'gtin',
+         weight_grams             = NULLIF(($2::jsonb)->>'weight_grams', '')::integer,
+         length_cm                = NULLIF(($2::jsonb)->>'length_cm', '')::numeric,
+         breadth_cm               = NULLIF(($2::jsonb)->>'breadth_cm', '')::numeric,
+         height_cm                = NULLIF(($2::jsonb)->>'height_cm', '')::numeric,
+         package_type             = ($2::jsonb)->>'package_type',
+         cost_price               = NULLIF(($2::jsonb)->>'cost_price', '')::numeric,
+         supplier_id              = NULLIF(($2::jsonb)->>'supplier_id', '')::uuid,
+         extra_delivery_days      = NULLIF(($2::jsonb)->>'extra_delivery_days', '')::integer,
+         inventory_quantity       = COALESCE(NULLIF(($2::jsonb)->>'inventory_quantity', '')::numeric, inventory_quantity),
+         inventory_sync           = COALESCE((($2::jsonb)->>'inventory_sync')::boolean, false),
+         low_stock_threshold      = NULLIF(($2::jsonb)->>'low_stock_threshold', '')::numeric,
+         mrp_ex_gst               = NULLIF(($2::jsonb)->>'mrp_ex_gst', '')::numeric,
+         sub_variant_type         = ($2::jsonb)->>'sub_variant_type',
+         ai_description           = ($2::jsonb)->>'ai_description',
+         ai_use_cases             = CASE WHEN jsonb_typeof(($2::jsonb)->'ai_use_cases') = 'array' THEN ARRAY(SELECT jsonb_array_elements_text(($2::jsonb)->'ai_use_cases')) ELSE NULL END,
+         ai_enriched_at           = NULLIF(($2::jsonb)->>'ai_enriched_at', '')::timestamptz,
+         ai_keywords              = CASE WHEN jsonb_typeof(($2::jsonb)->'ai_keywords') = 'array' THEN ARRAY(SELECT jsonb_array_elements_text(($2::jsonb)->'ai_keywords')) ELSE NULL END,
+         ai_who_uses_it           = ($2::jsonb)->>'ai_who_uses_it',
+         ai_application           = ($2::jsonb)->>'ai_application',
+         ai_product_type          = ($2::jsonb)->>'ai_product_type',
+         ai_features              = CASE WHEN jsonb_typeof(($2::jsonb)->'ai_features') = 'array' THEN ARRAY(SELECT jsonb_array_elements_text(($2::jsonb)->'ai_features')) ELSE NULL END,
+         ai_search_tags           = CASE WHEN jsonb_typeof(($2::jsonb)->'ai_search_tags') = 'array' THEN ARRAY(SELECT jsonb_array_elements_text(($2::jsonb)->'ai_search_tags')) ELSE NULL END,
+         discount_pct             = NULLIF(($2::jsonb)->>'discount_pct', '')::numeric,
+         sell_unit_id             = NULLIF(($2::jsonb)->>'sell_unit_id', '')::uuid,
+         stock_status             = COALESCE(NULLIF(($2::jsonb)->>'stock_status', ''), stock_status),
+         image_url                = ($2::jsonb)->>'image_url',
+         barcode                  = ($2::jsonb)->>'barcode',
+         isbn                     = ($2::jsonb)->>'isbn',
+         asin                     = ($2::jsonb)->>'asin',
+         brand_part_number        = ($2::jsonb)->>'brand_part_number',
+         country_of_origin        = ($2::jsonb)->>'country_of_origin',
+         shelf_life_days          = NULLIF(($2::jsonb)->>'shelf_life_days', '')::integer,
+         color                    = ($2::jsonb)->>'color',
+         color_hex                = ($2::jsonb)->>'color_hex',
+         volume_ml                = NULLIF(($2::jsonb)->>'volume_ml', '')::numeric,
+         net_weight_grams         = NULLIF(($2::jsonb)->>'net_weight_grams', '')::integer,
+         fragile                  = (($2::jsonb)->>'fragile')::boolean,
+         hazardous                = (($2::jsonb)->>'hazardous')::boolean,
+         flammable                = (($2::jsonb)->>'flammable')::boolean,
+         perishable               = (($2::jsonb)->>'perishable')::boolean,
+         certifications           = CASE WHEN jsonb_typeof(($2::jsonb)->'certifications') = 'array' THEN ARRAY(SELECT jsonb_array_elements_text(($2::jsonb)->'certifications')) ELSE NULL END,
+         compliance_standard      = ($2::jsonb)->>'compliance_standard',
+         safety_rating            = ($2::jsonb)->>'safety_rating',
+         warranty_months          = NULLIF(($2::jsonb)->>'warranty_months', '')::integer,
+         warranty_type            = ($2::jsonb)->>'warranty_type',
+         condition                = ($2::jsonb)->>'condition',
+         is_cod_allowed           = (($2::jsonb)->>'is_cod_allowed')::boolean,
+         launch_date              = NULLIF(($2::jsonb)->>'launch_date', '')::date,
+         discontinue_date         = NULLIF(($2::jsonb)->>'discontinue_date', '')::date,
+         sort_order               = NULLIF(($2::jsonb)->>'sort_order', '')::integer,
+         handling_days            = NULLIF(($2::jsonb)->>'handling_days', '')::integer,
+         shipping_class           = ($2::jsonb)->>'shipping_class',
+         is_oversized             = (($2::jsonb)->>'is_oversized')::boolean,
+         volumetric_weight_grams  = NULLIF(($2::jsonb)->>'volumetric_weight_grams', '')::integer,
+         is_digital               = (($2::jsonb)->>'is_digital')::boolean,
+         license_type             = ($2::jsonb)->>'license_type',
+         file_format              = ($2::jsonb)->>'file_format',
+         platform_compatibility   = CASE WHEN jsonb_typeof(($2::jsonb)->'platform_compatibility') = 'array' THEN ARRAY(SELECT jsonb_array_elements_text(($2::jsonb)->'platform_compatibility')) ELSE NULL END,
+         is_subscription          = (($2::jsonb)->>'is_subscription')::boolean,
+         subscription_intervals   = CASE WHEN jsonb_typeof(($2::jsonb)->'subscription_intervals') = 'array' THEN ARRAY(SELECT jsonb_array_elements_text(($2::jsonb)->'subscription_intervals')) ELSE '{}'::text[] END,
+         subscription_interval    = ($2::jsonb)->>'subscription_interval',
+         subscription_price       = NULLIF(($2::jsonb)->>'subscription_price', '')::numeric,
+         subscription_prices      = CASE WHEN jsonb_typeof(($2::jsonb)->'subscription_prices') = 'object' THEN ($2::jsonb)->'subscription_prices' ELSE subscription_prices END,
+         subscription_total_cycles = NULLIF(($2::jsonb)->>'subscription_total_cycles', '')::integer,
+         subscription_min_cycles  = NULLIF(($2::jsonb)->>'subscription_min_cycles', '')::integer,
+         is_bundle                = (($2::jsonb)->>'is_bundle')::boolean,
+         bundle_items             = ($2::jsonb)->'bundle_items',
+         meta_title               = ($2::jsonb)->>'meta_title',
+         meta_description         = ($2::jsonb)->>'meta_description',
+         meta_keywords            = CASE WHEN jsonb_typeof(($2::jsonb)->'meta_keywords') = 'array' THEN ARRAY(SELECT jsonb_array_elements_text(($2::jsonb)->'meta_keywords')) ELSE NULL END,
+         is_searchable            = (($2::jsonb)->>'is_searchable')::boolean,
+         tax_class                = ($2::jsonb)->>'tax_class',
+         inclusive_tax            = (($2::jsonb)->>'inclusive_tax')::boolean,
+         age_min                  = NULLIF(($2::jsonb)->>'age_min', '')::integer,
+         age_max                  = NULLIF(($2::jsonb)->>'age_max', '')::integer,
+         target_gender            = ($2::jsonb)->>'target_gender',
+         target_audience          = CASE WHEN jsonb_typeof(($2::jsonb)->'target_audience') = 'array' THEN ARRAY(SELECT jsonb_array_elements_text(($2::jsonb)->'target_audience')) ELSE NULL END,
+         serialized               = (($2::jsonb)->>'serialized')::boolean,
+         grade                    = ($2::jsonb)->>'grade',
+         specifications           = ($2::jsonb)->'specifications',
+         is_active                = CASE WHEN $3::boolean OR is_draft THEN true ELSE is_active END,
+         is_draft                 = false,
+         updated_at               = NOW()
+       WHERE id = $1`,
+      [
+        productId,
+        JSON.stringify({
+          ...fields,
+          sku: productSku || fields.sku,
+          slug: slug || fields.slug,
+          // Variant products price subscriptions per variant / sub-variant.
+          subscription_price: newHasVariants ? null : normalizeSubscriptionPrice(fields.subscription_price),
+          subscription_prices: newHasVariants
+            ? {}
+            : fields.subscription_prices === undefined
+              ? undefined
+              : normalizeSubscriptionPrices(fields.subscription_prices),
+          subscription_total_cycles: totalCycles,
+          subscription_min_cycles: minCycles,
+          sell_unit_id: newDigital ? null : fields.sell_unit_id,
+          ...(newDigital && {
+            has_variants: false,
+            perishable: false,
+            serialized: false,
+            inventory_sync: false,
+            stock_status: 'In Stock',
+          }),
+        }),
+        opts.activate === true,
+      ]
+    )
+
+    // Columns edited as plain form fields (Legal Metrology, usage, SEO keywords, …).
+    const extra = normalizeExtraFields(fields)
+    const extraSet = extraFieldsSetSql(Object.keys(extra), '$2::jsonb')
+    if (extraSet) await client.query(`UPDATE products SET ${extraSet} WHERE id = $1`, [productId, JSON.stringify(extra)])
+
+    // NOTE: Leaf-level supplier reconcile runs AFTER the variant + sub-variant
+    // upserts below, so each row's variant_sku / sub_variant_sku resolves to a
+    // freshly-persisted id. See "Reconcile suppliers per leaf" further down.
+
+    // UPSERT variants — never hard-delete to preserve FK references from POs/orders
+    // Only process variants that have valid SKUs
+    const validVariants = (variants as any[])
+      .filter((v: any) => v.sku)
+      .map((v: any) => ({
+        ...v,
+        subscription_price: normalizeSubscriptionPrice(v.subscription_price),
+        subscription_prices: normalizeSubscriptionPrices(v.subscription_prices),
+      }))
+    const draftSkus = validVariants.map((v: any) => v.sku)
+    const subsOffVariantIds = new Set<string>()
+
+    if (validVariants.length > 0) {
+      // Deactivate variants removed from draft (soft delete only)
+      await client.query(
+        `UPDATE product_variants SET is_active = false, updated_at = NOW()
+         WHERE product_id = $1 AND sku != ALL($2::text[]) AND is_active = true`,
+        [productId, draftSkus]
+      )
+      await client.query(
+        `INSERT INTO product_variants (
+         product_id, sku, variant_name, price, attributes, is_active, mrp,
+         price_ex_gst, mpn, gtin, asin, asin_match, isbn, pricing_type, unit, numeric_value,
+         weight_grams, length_cm, breadth_cm, height_cm,
+         package_type, cost_price, inventory_quantity, mrp_ex_gst,
+         variant_type, sub_variant_type, sub_variant_type_on, use_own_images,
+         discount_pct, stock_decimal_precision, sell_unit_id, stock_status, subscription_price,
+         subscription_prices, created_at, updated_at
+       )
+       SELECT $1, v->>'sku', v->>'variant_name', NULLIF(v->>'price','')::numeric, v->'attributes',
+         COALESCE((v->>'is_active')::boolean, true), NULLIF(v->>'mrp','')::numeric,
+         NULLIF(v->>'price_ex_gst','')::numeric, v->>'mpn', v->>'gtin',
+         NULLIF(v->>'asin',''), CASE WHEN NULLIF(v->>'asin','') IS NOT NULL THEN 'manual' ELSE NULL END,
+         NULLIF(v->>'isbn',''),
+         COALESCE(NULLIF(v->>'pricing_type',''), 'unit'),
+         v->>'unit', NULLIF(v->>'numeric_value','')::numeric,
+         NULLIF(v->>'weight_grams','')::integer, NULLIF(v->>'length_cm','')::numeric,
+         NULLIF(v->>'breadth_cm','')::numeric, NULLIF(v->>'height_cm','')::numeric,
+         v->>'package_type', NULLIF(v->>'cost_price','')::numeric,
+         COALESCE(NULLIF(v->>'inventory_quantity','')::numeric, 0), NULLIF(v->>'mrp_ex_gst','')::numeric,
+         v->>'variant_type', v->>'sub_variant_type', COALESCE((v->>'sub_variant_type_on')::boolean, false),
+         COALESCE((v->>'use_own_images')::boolean, false), COALESCE(NULLIF(v->>'discount_pct','')::numeric, 0),
+         COALESCE(NULLIF(v->>'stock_decimal_precision','')::integer, 0), NULLIF(v->>'sell_unit_id','')::uuid,
+         COALESCE(NULLIF(v->>'stock_status',''), 'In Stock'), NULLIF(v->>'subscription_price','')::numeric,
+         COALESCE(v->'subscription_prices', '{}'::jsonb), NOW(), NOW()
+       FROM jsonb_array_elements($2::jsonb) AS v
+       ON CONFLICT (sku) DO UPDATE SET
+         variant_name = EXCLUDED.variant_name, price = EXCLUDED.price,
+         attributes = EXCLUDED.attributes, is_active = EXCLUDED.is_active,
+         mrp = EXCLUDED.mrp, price_ex_gst = EXCLUDED.price_ex_gst,
+         mpn = EXCLUDED.mpn, gtin = EXCLUDED.gtin,
+         asin = COALESCE(EXCLUDED.asin, product_variants.asin),
+         asin_match = COALESCE(EXCLUDED.asin_match, product_variants.asin_match),
+         isbn = EXCLUDED.isbn,
+         pricing_type = EXCLUDED.pricing_type,
+         unit = EXCLUDED.unit, numeric_value = EXCLUDED.numeric_value,
+         weight_grams = EXCLUDED.weight_grams, length_cm = EXCLUDED.length_cm,
+         breadth_cm = EXCLUDED.breadth_cm, height_cm = EXCLUDED.height_cm,
+         package_type = EXCLUDED.package_type, cost_price = EXCLUDED.cost_price,
+         -- Stock is managed out-of-band (shelf / batches / serials), never by the draft
+         -- snapshot: an active row keeps its live value, a revived row restarts at 0. A row that
+         -- stays inactive was only switched off from the product page, so it keeps its stock.
+         inventory_quantity = CASE WHEN product_variants.is_active OR NOT EXCLUDED.is_active THEN product_variants.inventory_quantity ELSE 0 END,
+         mrp_ex_gst = EXCLUDED.mrp_ex_gst,
+         variant_type = EXCLUDED.variant_type, sub_variant_type = EXCLUDED.sub_variant_type,
+         sub_variant_type_on = EXCLUDED.sub_variant_type_on,
+         use_own_images = EXCLUDED.use_own_images, discount_pct = EXCLUDED.discount_pct,
+         stock_decimal_precision = EXCLUDED.stock_decimal_precision,
+         sell_unit_id = EXCLUDED.sell_unit_id, stock_status = EXCLUDED.stock_status,
+         subscription_price = EXCLUDED.subscription_price,
+         subscription_prices = EXCLUDED.subscription_prices,
+         updated_at = NOW()`,
+        [productId, JSON.stringify(validVariants)]
+      )
+      // "Has sub-variants" turned OFF removes that variant's live sub-variants (deleted, or
+      // deactivated when history references them). Only a literal false counts, and only
+      // when live had it on: a variant that was already off is left untouched.
+      const subsOffSkus = validVariants
+        .filter((v: any) => v.sub_variant_type_on === false || v.sub_variant_type_on === 'false')
+        .filter((v: any) => {
+          const live = (v.id && liveVariantById.get(v.id)) || liveVariantBySku.get(v.sku)
+          return !live || live.subs_on
+        })
+        .map((v: any) => v.sku as string)
+      if (subsOffSkus.length > 0) {
+        const offIds = await client.query<{ id: string }>(
+          `SELECT id FROM product_variants WHERE product_id = $1 AND sku = ANY($2::text[])`,
+          [productId, subsOffSkus]
+        )
+        const ids = (offIds?.rows || []).map(r => r.id)
+        if (ids.length > 0) {
+          const subIds = await client.query<{ id: string }>(
+            `SELECT id FROM product_sub_variants WHERE variant_id = ANY($1::uuid[])`,
+            [ids]
+          )
+          purged.push(
+            await purgeVariantRows(client, productId, { subVariantIds: (subIds?.rows || []).map(r => r.id) })
+          )
+        }
+      }
+      for (const sku of subsOffSkus) {
+        await client.query(
+          `UPDATE product_sub_variants SET is_active = false, updated_at = NOW()
+         WHERE variant_id = (SELECT id FROM product_variants WHERE product_id = $1 AND sku = $2)`,
+          [productId, sku]
+        )
+      }
+      if (subsOffSkus.length > 0) {
+        const offRows = await client.query<{ id: string }>(
+          `SELECT id FROM product_variants WHERE product_id = $1 AND sku = ANY($2::text[])`,
+          [productId, subsOffSkus]
+        )
+        for (const r of offRows.rows) subsOffVariantIds.add(r.id)
+      }
+      // Delete variant images for variants where use_own_images was turned off
+      const variantsWithOwnImagesOff = validVariants.filter((v: any) => !v.use_own_images && v.sku)
+      for (const v of variantsWithOwnImagesOff) {
+        await client.query(
+          `DELETE FROM variant_images
+         WHERE variant_id = (SELECT id FROM product_variants WHERE product_id = $1 AND sku = $2)`,
+          [productId, v.sku]
+        )
+      }
+    }
+
+    // ── Reconcile staged variant images → live variant_images ─────────────────
+    // Draft-staged variant images live in product_drafts.variant_images (flat array,
+    // each row tagged variant_id). Rows with a real uuid id are KEPT live rows; rows
+    // with a draft-vi- id are freshly-uploaded S3 files to INSERT. For every variant
+    // present in the stage we reconcile: delete live rows not in the keep-set, insert
+    // new staged rows, then apply display_order + a single is_primary. Runs after the
+    // variant upsert so variant ids are stable. Only variants that appear in the stage
+    // are touched (draft-entry seeds all active variants' images, so the admin clearing
+    // a variant's images shows up as that variant having zero staged rows → cleared).
+    const stagedVI = Array.isArray(draft.variant_images) ? (draft.variant_images as any[]) : []
+    if (!variantsOff && (stagedVI.length > 0 || validVariants.length > 0)) {
+      const byVariant = new Map<string, any[]>()
+      for (const vi of stagedVI) {
+        if (!vi.variant_id) continue
+        const list = byVariant.get(vi.variant_id) || []
+        list.push(vi)
+        byVariant.set(vi.variant_id, list)
+      }
+      // Reconcile each variant that (a) has staged rows, or (b) is an active variant in
+      // this publish (so a cleared-to-zero variant also gets its live images removed).
+      const activeVariantIds = await client.query<{ id: string }>(
+        `SELECT id FROM product_variants WHERE product_id = $1 AND is_active = true`,
+        [productId]
+      )
+      // A variant revived by this publish has no staged rows in older drafts; keep its live images.
+      const wasActive = new Set(liveActiveVariants.map(v => v.id))
+      const variantIds = new Set<string>([
+        ...byVariant.keys(),
+        ...activeVariantIds.rows.map(r => r.id).filter(id => wasActive.has(id)),
+      ])
+      for (const vid of variantIds) {
+        const rows = (byVariant.get(vid) || []).slice().sort((a, b) => (a.display_order ?? 0) - (b.display_order ?? 0))
+        const keepIds = rows.map(r => r.id).filter((id: any) => id && !String(id).startsWith('draft-vi-'))
+        // Remove live rows no longer kept.
+        await client.query(`DELETE FROM variant_images WHERE variant_id = $1 AND id <> ALL($2::uuid[])`, [vid, keepIds])
+        // Insert freshly-staged uploads (draft-vi- ids).
+        for (const r of rows) {
+          if (r.id && !String(r.id).startsWith('draft-vi-')) continue // existing live row
+          await client.query(
+            `INSERT INTO variant_images
+               (variant_id, image_url, thumbnail_url, s3_bucket, s3_key, s3_thumbnail_key,
+                file_name, file_size, mime_type, width, height, display_order, is_primary)
+             VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)`,
+            [
+              vid,
+              r.image_url,
+              r.thumbnail_url,
+              r.s3_bucket || process.env.S3_BUCKET_NAME || 'jeffi-stores-bucket',
+              r.s3_key || null,
+              r.s3_thumbnail_key || null,
+              r.file_name || null,
+              r.file_size ?? null,
+              r.mime_type || null,
+              r.width ?? null,
+              r.height ?? null,
+              r.display_order ?? 0,
+              !!r.is_primary,
+            ]
+          )
+        }
+        // Apply display_order + is_primary for kept (existing) live rows.
+        for (const r of rows) {
+          if (!r.id || String(r.id).startsWith('draft-vi-')) continue
+          await client.query(
+            `UPDATE variant_images SET display_order = $2, is_primary = $3 WHERE id = $1 AND variant_id = $4`,
+            [r.id, r.display_order ?? 0, !!r.is_primary, vid]
+          )
+        }
+        // Guarantee exactly one primary when the variant has any images.
+        const hasPrimary = rows.some(r => r.is_primary)
+        if (!hasPrimary) {
+          await client.query(
+            `UPDATE variant_images SET is_primary = TRUE
+             WHERE id = (SELECT id FROM variant_images WHERE variant_id = $1 ORDER BY display_order ASC, created_at ASC LIMIT 1)`,
+            [vid]
+          )
+        }
+      }
+    }
+
+    // Kept images stay the same rows (ids survive a publish); only changed ones are written.
+    const imagesJson = JSON.stringify(draft.images ?? [])
+    await client.query(
+      `DELETE FROM product_images WHERE product_id = $1
+         AND id::text NOT IN (SELECT img->>'id' FROM jsonb_array_elements($2::jsonb) AS img WHERE img->>'id' IS NOT NULL)`,
+      [productId, imagesJson]
+    )
+    // The primary moves in two steps (one primary per product is a unique index).
+    await client.query(
+      `UPDATE product_images SET is_primary = false WHERE product_id = $1 AND is_primary
+         AND id::text NOT IN (SELECT img->>'id' FROM jsonb_array_elements($2::jsonb) AS img
+                               WHERE (img->>'is_primary')::boolean AND img->>'id' IS NOT NULL)`,
+      [productId, imagesJson]
+    )
+    await client.query(
+      `UPDATE product_images pi SET
+         image_url = n.image_url, thumbnail_url = n.thumbnail_url, s3_bucket = n.s3_bucket, s3_key = n.s3_key,
+         s3_thumbnail_key = n.s3_thumbnail_key, file_name = n.file_name, file_size = n.file_size,
+         mime_type = n.mime_type, width = n.width, height = n.height, alt_text = n.alt_text,
+         display_order = n.display_order, is_primary = n.is_primary, updated_at = NOW()
+       FROM (SELECT img->>'id' AS id, img->>'image_url' AS image_url, img->>'thumbnail_url' AS thumbnail_url,
+                    img->>'s3_bucket' AS s3_bucket, img->>'s3_key' AS s3_key, img->>'s3_thumbnail_key' AS s3_thumbnail_key,
+                    img->>'file_name' AS file_name, NULLIF(img->>'file_size','')::bigint AS file_size,
+                    img->>'mime_type' AS mime_type, NULLIF(img->>'width','')::integer AS width,
+                    NULLIF(img->>'height','')::integer AS height, img->>'alt_text' AS alt_text,
+                    NULLIF(img->>'display_order','')::integer AS display_order, (img->>'is_primary')::boolean AS is_primary
+               FROM jsonb_array_elements($2::jsonb) AS img) n
+      WHERE pi.product_id = $1 AND pi.id::text = n.id
+        AND (pi.image_url, pi.thumbnail_url, pi.s3_bucket, pi.s3_key, pi.s3_thumbnail_key, pi.file_name, pi.file_size,
+             pi.mime_type, pi.width, pi.height, pi.alt_text, pi.display_order, pi.is_primary)
+            IS DISTINCT FROM
+            (n.image_url, n.thumbnail_url, n.s3_bucket, n.s3_key, n.s3_thumbnail_key, n.file_name, n.file_size,
+             n.mime_type, n.width, n.height, n.alt_text, n.display_order, n.is_primary)`,
+      [productId, imagesJson]
+    )
+    await client.query(
+      `INSERT INTO product_images (
+         id, product_id, image_url, thumbnail_url, s3_bucket, s3_key, s3_thumbnail_key,
+         file_name, file_size, mime_type, width, height, alt_text,
+         display_order, is_primary, blurhash, created_at, updated_at
+       )
+       SELECT CASE WHEN img->>'id' ~ ${UUID_SQL} THEN (img->>'id')::uuid ELSE gen_random_uuid() END,
+         $1, img->>'image_url', img->>'thumbnail_url', img->>'s3_bucket',
+         img->>'s3_key', img->>'s3_thumbnail_key', img->>'file_name',
+         NULLIF(img->>'file_size','')::bigint, img->>'mime_type',
+         NULLIF(img->>'width','')::integer, NULLIF(img->>'height','')::integer,
+         img->>'alt_text', NULLIF(img->>'display_order','')::integer,
+         (img->>'is_primary')::boolean, img->>'blurhash', NOW(), NOW()
+       FROM jsonb_array_elements($2::jsonb) AS img
+       WHERE NOT EXISTS (SELECT 1 FROM product_images pi WHERE pi.id::text = img->>'id')`,
+      [productId, imagesJson]
+    )
+
+    // Apply staged sub-variants only for variants the admin touched in draft mode: a
+    // _cleared sentinel (deletion), an _edited row, or a row with no persisted id
+    // (new). Rows that merely carry a real id are the entry-seeded live snapshot —
+    // with or without a _seeded tag — and are NOT a change: re-applying them used to
+    // re-activate sub-variants the toggle-OFF step above had just retired. Variants
+    // turned OFF are skipped entirely so staged adds for them are never inserted.
+    const isNewSubVariant = (sv: any) => !sv.id || String(sv.id).startsWith('draft-sv-')
+    const touchedVariantIds = new Set<string>()
+    for (const sv of subVariants as any[]) {
+      if (sv._cleared) {
+        let vid: string | null = sv.variant_id || null
+        if (!vid && UUID_RE.test(String(sv.original_id || ''))) {
+          const r = await client.query<{ variant_id: string }>(
+            `SELECT variant_id FROM product_sub_variants WHERE id = $1`,
+            [sv.original_id]
+          )
+          vid = r.rows[0]?.variant_id ?? null
+        }
+        if (vid) touchedVariantIds.add(vid)
+      } else if (sv.variant_id && (sv._edited || isNewSubVariant(sv))) {
+        touchedVariantIds.add(sv.variant_id)
+      }
+    }
+    for (const vid of subsOffVariantIds) touchedVariantIds.delete(vid)
+    if (variantsOff) touchedVariantIds.clear()
+    if (touchedVariantIds.size > 0) {
+      const num = (x: any): number | null => {
+        if (x == null || x === '') return null
+        const n = Number(x)
+        return Number.isFinite(n) ? n : null
+      }
+      const staged = (subVariants as any[]).filter((sv: any) => !sv._cleared && sv.sub_variant_name && sv.variant_id)
+
+      // id-preserving UPSERT per touched variant. A real UUID id → UPDATE in place
+      // (keeps FKs from order_items intact, no churn); a draft-sv- id (or missing) →
+      // INSERT a fresh row. Sub-variants of a touched variant that are absent from
+      // the staged set are SOFT-deactivated (never hard-deleted — order_items FK is
+      // SET NULL and we must preserve order provenance). inventory_quantity is
+      // preserved on UPDATE (managed out-of-band; the draft snapshot drops it), and
+      // the variant/product rollup below recomputes from the active children.
+      for (const vid of touchedVariantIds) {
+        const svsForVariant = staged.filter((sv: any) => sv.variant_id === vid)
+        const keepIds = svsForVariant
+          .map((sv: any) => sv.id)
+          .filter((id: any) => id && !String(id).startsWith('draft-sv-'))
+
+        // Soft-deactivate sub-variants of this variant that the draft dropped.
+        await client.query(
+          `UPDATE product_sub_variants SET is_active = false, updated_at = NOW()
+           WHERE variant_id = $1 AND id <> ALL($2::uuid[])`,
+          [vid, keepIds]
+        )
+
+        for (const sv of svsForVariant) {
+          let targetId: string | null = isNewSubVariant(sv) ? null : sv.id
+          if (!targetId && sv.sku) {
+            // A re-added name regenerates the SKU of its retired row: revive that row
+            // (order history stays linked to its id) instead of hitting the unique index.
+            const bySku = await client.query<{ id: string; variant_id: string; product_id: string }>(
+              `SELECT id, variant_id, product_id FROM product_sub_variants WHERE sku = $1`,
+              [sv.sku]
+            )
+            const hit = bySku.rows[0]
+            if (hit) {
+              if (hit.product_id !== productId || hit.variant_id !== vid) {
+                throw new Error(`Sub-variant SKU "${sv.sku}" is already used by another variant`)
+              }
+              targetId = hit.id
+            }
+          }
+          if (!targetId) {
+            await client.query(
+              `INSERT INTO product_sub_variants (variant_id, product_id, sku, sub_variant_name, price, mrp,
+                 price_ex_gst, mrp_ex_gst, attributes, is_active, inventory_quantity, discount_pct, stock_status,
+                 weight_grams, length_cm, breadth_cm, height_cm, package_type, subscription_price,
+                 subscription_prices, created_at, updated_at)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20::jsonb, NOW(), NOW())`,
+              [
+                vid,
+                productId,
+                sv.sku || null,
+                sv.sub_variant_name,
+                num(sv.price),
+                num(sv.mrp),
+                num(sv.price_ex_gst),
+                num(sv.mrp_ex_gst),
+                sv.attributes || null,
+                sv.is_active != null ? sv.is_active : true,
+                num(sv.inventory_quantity) ?? 0,
+                num(sv.discount_pct) ?? 0,
+                sv.stock_status || 'In Stock',
+                num(sv.weight_grams) ?? null,
+                num(sv.length_cm) ?? null,
+                num(sv.breadth_cm) ?? null,
+                num(sv.height_cm) ?? null,
+                sv.package_type || null,
+                normalizeSubscriptionPrice(sv.subscription_price),
+                JSON.stringify(normalizeSubscriptionPrices(sv.subscription_prices)),
+              ]
+            )
+          } else {
+            // UPDATE by id. Stock is out-of-band: an active row keeps its quantity, a
+            // revived (inactive) row restarts at 0.
+            await client.query(
+              `UPDATE product_sub_variants SET
+                 sku = $3, sub_variant_name = $4, price = $5, mrp = $6,
+                 price_ex_gst = $7, mrp_ex_gst = $8, attributes = COALESCE($9, attributes),
+                 is_active = $10, discount_pct = $11, stock_status = $12,
+                 inventory_quantity = CASE WHEN is_active OR NOT $10::boolean THEN inventory_quantity ELSE 0 END,
+                 weight_grams = $13, length_cm = $14, breadth_cm = $15, height_cm = $16, package_type = $17,
+                 subscription_price = $18, subscription_prices = COALESCE($19::jsonb, subscription_prices),
+                 updated_at = NOW()
+               WHERE id = $1 AND product_id = $2`,
+              [
+                targetId,
+                productId,
+                sv.sku || null,
+                sv.sub_variant_name,
+                num(sv.price),
+                num(sv.mrp),
+                num(sv.price_ex_gst),
+                num(sv.mrp_ex_gst),
+                sv.attributes || null,
+                sv.is_active != null ? sv.is_active : true,
+                num(sv.discount_pct) ?? 0,
+                sv.stock_status || 'In Stock',
+                num(sv.weight_grams) ?? null,
+                num(sv.length_cm) ?? null,
+                num(sv.breadth_cm) ?? null,
+                num(sv.height_cm) ?? null,
+                sv.package_type || null,
+                normalizeSubscriptionPrice(sv.subscription_price),
+                sv.subscription_prices === undefined
+                  ? null
+                  : JSON.stringify(normalizeSubscriptionPrices(sv.subscription_prices)),
+              ]
+            )
+          }
+        }
+      }
+    }
+
+    // has_variants turned OFF: retire every variant/sub-variant now (soft only —
+    // order_items FK is SET NULL, purchase_order_items is RESTRICT). Their stock is
+    // discarded by the structural block below and the product restarts at zero.
+    if (turnedOffVariants) {
+      const allVariants = await client.query<{ id: string }>(`SELECT id FROM product_variants WHERE product_id = $1`, [
+        productId,
+      ])
+      purged.push(
+        await purgeVariantRows(client, productId, { variantIds: (allVariants?.rows || []).map(r => r.id) })
+      )
+      await client.query(
+        `UPDATE product_sub_variants SET is_active = false, updated_at = NOW()
+         WHERE variant_id IN (SELECT id FROM product_variants WHERE product_id = $1)`,
+        [productId]
+      )
+      await client.query(
+        `UPDATE product_variants SET is_active = false, updated_at = NOW()
+         WHERE product_id = $1`,
+        [productId]
+      )
+    }
+
+    // ── Structural transitions: stock is held at LEAF grains only ────────────
+    // Compare the pre-publish leaf set with the post-upsert state. A grain whose
+    // level changes in this publish starts again from zero, in both directions:
+    //  • A grain that GAINS children (product → variants, variant → sub-variants)
+    //    stops being a leaf: its physical rows (shelf / batches / in-stock serials)
+    //    are removed and its central quantity becomes the child rollup (below).
+    //  • A child grain RETIRED here has its physical rows removed and its row zeroed.
+    //    A parent that becomes a leaf again is zeroed as well; it never carries the
+    //    retired children's quantity. Stock is received afresh at the new leaf.
+    //  • Retired rows always end at inventory_quantity 0 so a later revival cannot
+    //    resurrect stale stock. Sold serials keep their historical grain.
+    const nowVariants = (
+      await client.query<{ id: string; has_subs: boolean }>(
+        `SELECT v.id, EXISTS (SELECT 1 FROM product_sub_variants sv
+                            WHERE sv.variant_id = v.id AND sv.is_active = true) AS has_subs
+         FROM product_variants v WHERE v.product_id = $1 AND v.is_active = true`,
+        [productId]
+      )
+    ).rows
+    const nowSubIds = new Set(
+      (
+        await client.query<{ id: string }>(
+          `SELECT sv.id FROM product_sub_variants sv
+         JOIN product_variants v ON v.id = sv.variant_id
+        WHERE v.product_id = $1 AND v.is_active = true AND sv.is_active = true`,
+          [productId]
+        )
+      ).rows.map(r => r.id)
+    )
+    const nowVariantIds = new Set(nowVariants.map(v => v.id))
+    const nowParentIds = new Set(nowVariants.filter(v => v.has_subs).map(v => v.id))
+    const liveParentIds = new Set(liveActiveVariants.filter(v => v.has_subs).map(v => v.id))
+
+    const GRAIN = `product_id = $1 AND variant_id IS NOT DISTINCT FROM $2::uuid AND sub_variant_id IS NOT DISTINCT FROM $3::uuid`
+    const discardGrainStock = async (variantId: string | null, subVariantId: string | null) => {
+      const p = [productId, variantId, subVariantId]
+      await client.query(`DELETE FROM product_serials WHERE ${GRAIN} AND status = 'in_stock'`, p)
+      await client.query(`DELETE FROM product_batches WHERE ${GRAIN}`, p)
+      await client.query(`DELETE FROM shelf_stock WHERE ${GRAIN}`, p)
+    }
+
+    const retiredVariantIds = liveActiveVariants.filter(v => !nowVariantIds.has(v.id)).map(v => v.id)
+    const retiredSubsByVariant = new Map<string, string[]>()
+    for (const sv of liveActiveSubVariants) {
+      if (nowSubIds.has(sv.id)) continue
+      retiredSubsByVariant.set(sv.variant_id, [...(retiredSubsByVariant.get(sv.variant_id) || []), sv.id])
+    }
+
+    // Reverse: retired sub-variants (under a retired variant too) are discarded; a
+    // variant left without sub-variants restarts at zero.
+    const leafAgainVariantIds: string[] = []
+    for (const [vid, subIds] of retiredSubsByVariant) {
+      for (const sid of subIds) await discardGrainStock(vid, sid)
+      if (nowVariantIds.has(vid) && !nowParentIds.has(vid)) leafAgainVariantIds.push(vid)
+    }
+    if (leafAgainVariantIds.length > 0) {
+      await client.query(
+        `UPDATE product_variants SET inventory_quantity = 0, updated_at = NOW() WHERE id = ANY($1::uuid[])`,
+        [leafAgainVariantIds]
+      )
+    }
+
+    // Reverse: retired variants are discarded; a product left without variants
+    // restarts at zero.
+    for (const vid of retiredVariantIds) await discardGrainStock(vid, null)
+    if (retiredVariantIds.length > 0) {
+      await client.query(
+        `UPDATE product_sub_variants SET is_active = false, updated_at = NOW()
+          WHERE variant_id = ANY($1::uuid[]) AND is_active = true`,
+        [retiredVariantIds]
+      )
+      if (nowVariantIds.size === 0) {
+        await client.query(`UPDATE products SET inventory_quantity = 0, updated_at = NOW() WHERE id = $1`, [productId])
+      }
+    }
+
+    // Forward: the product gained its first active variants.
+    if (liveActiveVariants.length === 0 && nowVariantIds.size > 0) await discardGrainStock(null, null)
+    // Forward: variants that gained their first active sub-variants.
+    for (const v of nowVariants) {
+      if (v.has_subs && !liveParentIds.has(v.id)) await discardGrainStock(v.id, null)
+    }
+
+    // Rows retired by THIS publish never keep stock. Rows that were already inactive (switched
+    // off from the product page) keep theirs: the draft did not touch them.
+    const retiredSubIds = [...retiredSubsByVariant.values()].flat()
+    await client.query(
+      `UPDATE product_sub_variants sv SET inventory_quantity = 0, updated_at = NOW()
+         FROM product_variants v
+        WHERE sv.variant_id = v.id AND v.product_id = $1
+          AND (sv.is_active = false OR v.is_active = false) AND sv.inventory_quantity <> 0
+          AND (sv.id = ANY($2::uuid[]) OR v.id = ANY($3::uuid[]))`,
+      [productId, retiredSubIds, retiredVariantIds]
+    )
+    await client.query(
+      `UPDATE product_variants SET inventory_quantity = 0, updated_at = NOW()
+        WHERE product_id = $1 AND is_active = false AND inventory_quantity <> 0 AND id = ANY($2::uuid[])`,
+      [productId, retiredVariantIds]
+    )
+
+    // ── Roll variant/product inventory up from the child grains ──────────────
+    // The variant upsert can't set variant inventory_quantity (the draft snapshot
+    // drops it), so for a variant that HAS active sub-variants, recompute its
+    // inventory = SUM(active sub-variants). Then roll the product up = SUM(active
+    // variants). This runs on EVERY publish (not just the first), so a 2nd publish
+    // no longer leaves the variant at 0 when the client-side bootstrap re-sync
+    // doesn't fire. Variants WITHOUT sub-variants keep their preserved value (the
+    // EXISTS guard + COALESCE fallback leave them untouched).
+    await client.query(
+      `UPDATE product_variants pv SET inventory_quantity = COALESCE(
+         (SELECT SUM(sv.inventory_quantity) FROM product_sub_variants sv
+          WHERE sv.variant_id = pv.id AND sv.is_active = true), pv.inventory_quantity),
+         updated_at = NOW()
+       WHERE pv.product_id = $1
+         AND EXISTS (SELECT 1 FROM product_sub_variants sv WHERE sv.variant_id = pv.id AND sv.is_active = true)`,
+      [productId]
+    )
+    await client.query(
+      `UPDATE products SET inventory_quantity = COALESCE(
+         (SELECT SUM(inventory_quantity) FROM product_variants WHERE product_id = $1 AND is_active = true), inventory_quantity),
+         updated_at = NOW()
+       WHERE id = $1
+         AND EXISTS (SELECT 1 FROM product_variants WHERE product_id = $1 AND is_active = true)`,
+      [productId]
+    )
+
+    // ── Reconcile suppliers per LEAF ─────────────────────────────────────────
+    // Runs AFTER the variant + sub-variant upserts above so variant_sku /
+    // sub_variant_sku carried on each draft row resolves to a persisted id.
+    // Carrier: one flat fields.product_suppliers array. Each row optionally
+    // carries variant_sku (variant leaf) or sub_variant_sku (sub-variant leaf),
+    // or neither (product leaf). We resolve the SKU to an id, group rows per
+    // leaf, and reconcile each leaf scoped by (product_id, variant_id,
+    // sub_variant_id) using IS NOT DISTINCT FROM for the nullable leaf columns.
+    const draftSuppliers = Array.isArray((draft.fields as any)?.product_suppliers)
+      ? ((draft.fields as any).product_suppliers as any[])
+      : null
+    if (draftSuppliers) {
+      // Resolve each row to a leaf { variantId, subVariantId } — skip rows whose
+      // tagged SKU does not resolve to a persisted variant/sub-variant.
+      const skuVariantCache = new Map<string, string | null>()
+      const skuSubVariantCache = new Map<string, string | null>()
+      async function resolveVariantId(sku: string): Promise<string | null> {
+        if (skuVariantCache.has(sku)) return skuVariantCache.get(sku) ?? null
+        const r = await client.query(`SELECT id FROM product_variants WHERE product_id = $1 AND sku = $2 LIMIT 1`, [
+          productId,
+          sku,
+        ])
+        const id = r.rows[0]?.id ?? null
+        skuVariantCache.set(sku, id)
+        return id
+      }
+      async function resolveSubVariantId(variantId: string, subName: string): Promise<string | null> {
+        const cacheKey = `${variantId}:${subName}`
+        if (skuSubVariantCache.has(cacheKey)) return skuSubVariantCache.get(cacheKey) ?? null
+        const r = await client.query(
+          `SELECT id FROM product_sub_variants
+           WHERE product_id = $1 AND variant_id = $2 AND sub_variant_name = $3 AND is_active = true
+           ORDER BY created_at DESC LIMIT 1`,
+          [productId, variantId, subName]
+        )
+        const id = r.rows[0]?.id ?? null
+        skuSubVariantCache.set(cacheKey, id)
+        return id
+      }
+
+      // leafKey `${variantId||NIL}:${subVariantId||NIL}` -> { variantId, subVariantId, rows }
+      const NIL = '00000000-0000-0000-0000-000000000000'
+      const leaves = new Map<string, { variantId: string | null; subVariantId: string | null; rows: any[] }>()
+      // The draft keeps every leaf's rows across toggles; only the leaves of the published
+      // structure are applied (product leaf, variant leaf, or sub-variant leaf).
+      const subsOnBySku = new Map(
+        validVariants.map((v: any) => [String(v.sku), v.sub_variant_type_on === true || v.sub_variant_type_on === 'true'])
+      )
+      const inStructure = (s: any) => {
+        const varSku = s.variant_sku ? String(s.variant_sku) : ''
+        if (!varSku) return !newHasVariants
+        if (variantsOff) return false
+        if (!subsOnBySku.has(varSku)) return true
+        return s.sub_variant_name ? subsOnBySku.get(varSku) === true : subsOnBySku.get(varSku) !== true
+      }
+      for (const s of draftSuppliers) {
+        const supplierId = String(s.supplier_id || '').trim()
+        if (!supplierId) continue
+        if (!inStructure(s)) continue
+        let variantId: string | null = null
+        let subVariantId: string | null = null
+        const subName = s.sub_variant_name ? String(s.sub_variant_name) : ''
+        const varSku = s.variant_sku ? String(s.variant_sku) : ''
+        if (subName && varSku) {
+          // Sub-variant leaf: resolve parent variant by SKU, then sub-variant by name.
+          variantId = await resolveVariantId(varSku)
+          if (!variantId) continue
+          subVariantId = await resolveSubVariantId(variantId, subName)
+          if (!subVariantId) continue
+          variantId = null // leaf is the sub-variant, not the variant
+        } else if (varSku) {
+          variantId = await resolveVariantId(varSku)
+          if (!variantId) continue // SKU didn't resolve → skip row
+        }
+        const key = `${variantId || NIL}:${subVariantId || NIL}`
+        let leaf = leaves.get(key)
+        if (!leaf) {
+          leaf = { variantId, subVariantId, rows: [] }
+          leaves.set(key, leaf)
+        }
+        leaf.rows.push(s)
+      }
+
+      for (const { variantId, subVariantId, rows } of leaves.values()) {
+        const keepSupplierIds = rows.map((s: any) => String(s.supplier_id || '').trim()).filter(Boolean)
+        // Deactivate rows for this leaf whose supplier is no longer in the draft set.
+        await client.query(
+          `UPDATE product_suppliers SET is_active = false, is_preferred = false, updated_at = NOW()
+           WHERE product_id = $1
+             AND variant_id IS NOT DISTINCT FROM $2::uuid
+             AND sub_variant_id IS NOT DISTINCT FROM $3::uuid
+             AND is_active = true
+             AND supplier_id <> ALL($4::uuid[])`,
+          [productId, variantId, subVariantId, keepSupplierIds]
+        )
+
+        for (const s of rows) {
+          const supplierId = String(s.supplier_id || '').trim()
+          if (!supplierId) continue
+          const unitCost = Number(s.unit_cost)
+          if (!Number.isFinite(unitCost) || unitCost < 0) continue
+          const currency = s.currency ? String(s.currency).slice(0, 3) : 'INR'
+          const gstInclusive = !!s.gst_inclusive
+          const moq = s.moq != null && Number.isFinite(Number(s.moq)) ? Number(s.moq) : null
+          const leadTime =
+            s.lead_time_days != null && Number.isInteger(Number(s.lead_time_days)) ? Number(s.lead_time_days) : null
+          const notes = s.notes ? String(s.notes).slice(0, 500) : null
+
+          // Current active row for this leaf + supplier (latest), if any.
+          const cur = await client.query(
+            `SELECT id, unit_cost FROM product_suppliers
+             WHERE product_id = $1
+               AND variant_id IS NOT DISTINCT FROM $2::uuid
+               AND sub_variant_id IS NOT DISTINCT FROM $3::uuid
+               AND supplier_id = $4 AND is_active = true
+             ORDER BY effective_date DESC, created_at DESC LIMIT 1`,
+            [productId, variantId, subVariantId, supplierId]
+          )
+          const existing = cur.rows[0]
+          if (!existing) {
+            await client.query(
+              `INSERT INTO product_suppliers
+                 (product_id, variant_id, sub_variant_id, supplier_id, unit_cost, currency, gst_inclusive, moq, lead_time_days, is_preferred, notes)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10)`,
+              [productId, variantId, subVariantId, supplierId, unitCost, currency, gstInclusive, moq, leadTime, notes]
+            )
+          } else if (Number(existing.unit_cost) !== unitCost) {
+            // Price changed → new dated row, deactivate old (preserve history).
+            await client.query(
+              `UPDATE product_suppliers SET is_active = false, is_preferred = false, updated_at = NOW() WHERE id = $1`,
+              [existing.id]
+            )
+            await client.query(
+              `INSERT INTO product_suppliers
+                 (product_id, variant_id, sub_variant_id, supplier_id, unit_cost, currency, gst_inclusive, moq, lead_time_days, is_preferred, notes)
+               VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, false, $10)`,
+              [productId, variantId, subVariantId, supplierId, unitCost, currency, gstInclusive, moq, leadTime, notes]
+            )
+          } else {
+            await client.query(
+              `UPDATE product_suppliers
+                 SET currency = $1, gst_inclusive = $2, moq = $3, lead_time_days = $4, notes = $5,
+                     is_preferred = false, updated_at = NOW()
+               WHERE id = $6`,
+              [currency, gstInclusive, moq, leadTime, notes, existing.id]
+            )
+          }
+        }
+
+        // Set the single preferred flag LAST per leaf, matching the draft row.
+        await client.query(
+          `UPDATE product_suppliers SET is_preferred = false, updated_at = NOW()
+           WHERE product_id = $1
+             AND variant_id IS NOT DISTINCT FROM $2::uuid
+             AND sub_variant_id IS NOT DISTINCT FROM $3::uuid
+             AND is_preferred = true`,
+          [productId, variantId, subVariantId]
+        )
+        const preferredSupplierId = rows.find((s: any) => s.is_preferred)?.supplier_id
+        if (preferredSupplierId) {
+          await client.query(
+            `UPDATE product_suppliers SET is_preferred = true, updated_at = NOW()
+             WHERE id = (
+               SELECT id FROM product_suppliers
+               WHERE product_id = $1
+                 AND variant_id IS NOT DISTINCT FROM $2::uuid
+                 AND sub_variant_id IS NOT DISTINCT FROM $3::uuid
+                 AND supplier_id = $4 AND is_active = true
+               ORDER BY effective_date DESC, created_at DESC LIMIT 1
+             )`,
+            [productId, variantId, subVariantId, String(preferredSupplierId)]
+          )
+        }
+
+        // Denormalize the leaf's preferred supplier to its cache column.
+        // products.supplier_id (product leaf) is already handled by the main
+        // UPDATE above; here we cache the variant/sub-variant leaves.
+        const cachedSupplierId = preferredSupplierId ? String(preferredSupplierId) : null
+        if (subVariantId) {
+          await client.query(
+            `UPDATE product_sub_variants SET supplier_id = $2::uuid, updated_at = NOW() WHERE id = $1`,
+            [subVariantId, cachedSupplierId]
+          )
+        } else if (variantId) {
+          await client.query(`UPDATE product_variants SET supplier_id = $2::uuid, updated_at = NOW() WHERE id = $1`, [
+            variantId,
+            cachedSupplierId,
+          ])
+        }
+      }
+
+      // Deactivate suppliers for leaves that are entirely absent from the draft
+      // (all suppliers removed). The per-leaf loop only visits leaves that still
+      // have >= 1 row; leaves with zero rows are skipped and their DB rows stay
+      // active without this cleanup.
+      const coveredLeafKeys = new Set(Array.from(leaves.keys()))
+      const dbLeaves = await client.query(
+        `SELECT DISTINCT
+           COALESCE(ps.variant_id::text, '${NIL}') AS vid,
+           COALESCE(ps.sub_variant_id::text, '${NIL}') AS svid,
+           ps.variant_id, ps.sub_variant_id, COALESCE(v.sku, pv.sku) AS leaf_variant_sku
+         FROM product_suppliers ps
+         LEFT JOIN product_variants v ON v.id = ps.variant_id
+         LEFT JOIN product_sub_variants sub ON sub.id = ps.sub_variant_id
+         LEFT JOIN product_variants pv ON pv.id = sub.variant_id
+         WHERE ps.product_id = $1 AND ps.is_active = true`,
+        [productId]
+      )
+      const draftSkuSet = new Set(draftSkus.map(String))
+      for (const row of dbLeaves.rows) {
+        const key = `${row.vid}:${row.svid}`
+        // Leaves of a variant that was already inactive and is absent from the draft are not the draft's to change.
+        const leafSku = row.leaf_variant_sku ? String(row.leaf_variant_sku) : ''
+        if (leafSku && !variantsOff && !draftSkuSet.has(leafSku) && liveVariantBySku.get(leafSku)?.is_active === false)
+          continue
+        if (!coveredLeafKeys.has(key)) {
+          await client.query(
+            `UPDATE product_suppliers SET is_active = false, is_preferred = false, updated_at = NOW()
+             WHERE product_id = $1
+               AND variant_id IS NOT DISTINCT FROM $2::uuid
+               AND sub_variant_id IS NOT DISTINCT FROM $3::uuid
+               AND is_active = true`,
+            [productId, row.variant_id, row.sub_variant_id]
+          )
+        }
+      }
+    }
+
+    // Units: UPSERT all scopes — product-level, variant-level, sub-variant-level.
+    // Product-level rows are upserted in place, NOT delete-then-reinsert: their ids are
+    // referenced by products.sell_unit_id and product_variants.sell_unit_id (FK ON DELETE
+    // SET NULL) and by product_unit_rules (ON DELETE CASCADE). Recreating them silently
+    // unlinked the base unit — which the GRN receive route reads qty_step through — and
+    // dropped every unit rule on each publish.
+    const productUnits = (units as any[]).filter(
+      (u: any) =>
+        !u._cleared && (!u.variant_id || u.variant_id === 'null') && (!u.sub_variant_id || u.sub_variant_id === 'null')
+    )
+    if (productUnits.length > 0) {
+      // Clear the scope's single-flag rows FIRST so an incoming base/purchase-default
+      // with a DIFFERENT unit name (a unit switch) doesn't collide with the old one on
+      // uniq_product_units_one_base_product / one_purchase_product during the upsert.
+      await client.query(
+        `UPDATE product_units SET is_base = FALSE, is_purchase_default = FALSE
+          WHERE product_id = $1 AND variant_id IS NULL AND sub_variant_id IS NULL`,
+        [productId]
+      )
+      await client.query(
+        `INSERT INTO product_units (
+           product_id, variant_id, unit, factor, is_base, is_purchase_default,
+           price_override, display_label, notes, dimension, conversion_meta,
+           sub_variant_id, min_qty, max_qty, qty_step, created_at, updated_at
+         )
+         SELECT $1, NULL,
+           u->>'unit', (u->>'factor')::numeric,
+           COALESCE((u->>'is_base')::boolean, false), COALESCE((u->>'is_purchase_default')::boolean, false),
+           NULLIF(u->>'price_override','')::numeric, u->>'display_label',
+           u->>'notes', u->>'dimension', u->'conversion_meta', NULL,
+           NULLIF(u->>'min_qty','')::numeric, NULLIF(u->>'max_qty','')::numeric,
+           NULLIF(u->>'qty_step','')::numeric, NOW(), NOW()
+         FROM jsonb_array_elements($2::jsonb) AS u
+         ON CONFLICT (product_id, unit) WHERE variant_id IS NULL DO UPDATE SET
+           factor = EXCLUDED.factor, is_base = EXCLUDED.is_base,
+           is_purchase_default = EXCLUDED.is_purchase_default,
+           price_override = EXCLUDED.price_override, display_label = EXCLUDED.display_label,
+           notes = EXCLUDED.notes, dimension = EXCLUDED.dimension,
+           conversion_meta = EXCLUDED.conversion_meta, min_qty = EXCLUDED.min_qty,
+           max_qty = EXCLUDED.max_qty, qty_step = EXCLUDED.qty_step, updated_at = NOW()`,
+        [productId, JSON.stringify(productUnits)]
+      )
+    }
+
+    // Remove product-level units the draft no longer lists (an explicit removal),
+    // leaving the surviving rows' ids — and everything referencing them — intact.
+    // Only when the draft actually carries units: an empty list means "nothing
+    // staged at this scope", not "delete every unit".
+    if (productUnits.length > 0) {
+      await client.query(
+        `DELETE FROM product_units
+          WHERE product_id = $1 AND variant_id IS NULL AND sub_variant_id IS NULL
+            AND NOT (unit = ANY($2::text[]))`,
+        [productId, productUnits.map((u: any) => u.unit)]
+      )
+    }
+
+    // Re-link the product's selling unit to its base row. The FK is ON DELETE SET NULL,
+    // so any earlier delete-and-recreate left this dangling.
+    await client.query(
+      `UPDATE products p SET sell_unit_id = pu.id, updated_at = NOW()
+         FROM product_units pu
+        WHERE pu.product_id = p.id AND pu.variant_id IS NULL AND pu.sub_variant_id IS NULL
+          AND pu.is_base = true AND p.id = $1
+          AND p.sell_unit_id IS DISTINCT FROM pu.id`,
+      [productId]
+    )
+
+    // UPSERT variant-level units from draft (preserve IDs via ON CONFLICT on product_id+variant_id+unit)
+    // First delete variant units that were explicitly cleared (Reset to product default)
+    const clearedVariantUnitIds = (units as any[])
+      .filter((u: any) => u._cleared && u.variant_id && u.variant_id !== 'null')
+      .map((u: any) => u.variant_id)
+    for (const vid of clearedVariantUnitIds) {
+      await client.query(`DELETE FROM product_units WHERE product_id = $1 AND variant_id = $2`, [productId, vid])
+      // Clear sell_unit_id on the variant so it inherits from product
+      await client.query(`UPDATE product_variants SET sell_unit_id = NULL, updated_at = NOW() WHERE id = $1`, [vid])
+    }
+    // The draft keeps units of toggled-off children; only units of published rows are applied.
+    const purgedVariantIds = new Set(purged.flatMap(p => p.deletedVariantIds))
+    const purgedSubIds = new Set(purged.flatMap(p => p.deletedSubVariantIds))
+    const variantUnits = (units as any[]).filter(
+      (u: any) =>
+        !u._cleared && u.variant_id && u.variant_id !== 'null' && !variantsOff && !purgedVariantIds.has(u.variant_id)
+    )
+    // Clear each variant scope's flags once before its upserts, so a base/purchase-default
+    // switch to a different unit name doesn't collide on the one_base/one_purchase_variant indexes.
+    for (const vid of new Set(variantUnits.map((u: any) => u.variant_id))) {
+      await client.query(
+        `UPDATE product_units SET is_base = FALSE, is_purchase_default = FALSE
+          WHERE product_id = $1 AND variant_id = $2 AND sub_variant_id IS NULL`,
+        [productId, vid]
+      )
+    }
+    for (const u of variantUnits) {
+      await client.query(
+        `INSERT INTO product_units (
+           product_id, variant_id, unit, factor, is_base, is_purchase_default,
+           price_override, display_label, notes, dimension, conversion_meta,
+           sub_variant_id, min_qty, max_qty, qty_step, created_at, updated_at
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, NOW(), NOW())
+         ON CONFLICT (variant_id, unit) WHERE variant_id IS NOT NULL DO UPDATE SET
+           factor = EXCLUDED.factor, is_base = EXCLUDED.is_base,
+           is_purchase_default = EXCLUDED.is_purchase_default,
+           price_override = EXCLUDED.price_override, display_label = EXCLUDED.display_label,
+           notes = EXCLUDED.notes, dimension = EXCLUDED.dimension,
+           conversion_meta = EXCLUDED.conversion_meta, min_qty = EXCLUDED.min_qty,
+           max_qty = EXCLUDED.max_qty, qty_step = EXCLUDED.qty_step, updated_at = NOW()`,
+        [
+          productId,
+          u.variant_id,
+          u.unit,
+          u.factor ?? 1,
+          u.is_base ?? false,
+          u.is_purchase_default ?? false,
+          u.price_override ?? null,
+          u.display_label ?? null,
+          u.notes ?? null,
+          u.dimension ?? 'count',
+          u.conversion_meta ?? null,
+          u.sub_variant_id ?? null,
+          u.min_qty ?? 1,
+          u.max_qty ?? null,
+          u.qty_step ?? 1,
+        ]
+      )
+    }
+
+    // Variants follow their default unit too (the storefront reads sell_unit_id before is_base).
+    await client.query(
+      `UPDATE product_variants pv SET sell_unit_id = pu.id, updated_at = NOW()
+         FROM product_units pu
+        WHERE pu.variant_id = pv.id AND pu.sub_variant_id IS NULL AND pu.is_base = true
+          AND pv.product_id = $1 AND pv.sell_unit_id IS DISTINCT FROM pu.id`,
+      [productId]
+    )
+
+    // UPSERT sub-variant-level units from draft (scope: sub_variant_id set). These
+    // are stored with variant_id null + sub_variant_id in the draft; without this
+    // branch they were silently dropped on publish. Cleared ones are deleted first.
+    const clearedSubVariantUnitIds = (units as any[])
+      .filter((u: any) => u._cleared && u.sub_variant_id && u.sub_variant_id !== 'null')
+      .map((u: any) => u.sub_variant_id)
+    for (const svid of clearedSubVariantUnitIds) {
+      await client.query(`DELETE FROM product_units WHERE product_id = $1 AND sub_variant_id = $2`, [productId, svid])
+    }
+    const subVariantUnits = (units as any[]).filter(
+      (u: any) =>
+        !u._cleared && u.sub_variant_id && u.sub_variant_id !== 'null' && !variantsOff && !purgedSubIds.has(u.sub_variant_id)
+    )
+    // Clear each sub-variant scope's flags once before its upserts, so a base/purchase-default
+    // switch to a different unit name doesn't collide on the one_base/one_purchase_sub_variant indexes.
+    for (const svid of new Set(subVariantUnits.map((u: any) => u.sub_variant_id))) {
+      await client.query(
+        `UPDATE product_units SET is_base = FALSE, is_purchase_default = FALSE
+          WHERE product_id = $1 AND sub_variant_id = $2`,
+        [productId, svid]
+      )
+    }
+    for (const u of subVariantUnits) {
+      // Carry variant_id so a sub-variant unit row keeps its full grain (the live
+      // route writes it too). A same-`unit` row at another grain can still raise a
+      // unique_violation that ON CONFLICT (sub_variant_id, unit) can't catch, so
+      // guard with a savepoint and fall back to an in-place update.
+      await client.query('SAVEPOINT sv_unit')
+      try {
+        await client.query(
+          `INSERT INTO product_units (
+             product_id, variant_id, unit, factor, is_base, is_purchase_default,
+             price_override, display_label, notes, dimension, conversion_meta,
+             sub_variant_id, min_qty, max_qty, qty_step, created_at, updated_at
+           ) VALUES ($1, $15, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, NOW(), NOW())
+           ON CONFLICT (sub_variant_id, unit) WHERE sub_variant_id IS NOT NULL DO UPDATE SET
+             factor = EXCLUDED.factor, is_base = EXCLUDED.is_base,
+             is_purchase_default = EXCLUDED.is_purchase_default,
+             price_override = EXCLUDED.price_override, display_label = EXCLUDED.display_label,
+             notes = EXCLUDED.notes, dimension = EXCLUDED.dimension,
+             conversion_meta = EXCLUDED.conversion_meta, min_qty = EXCLUDED.min_qty,
+             max_qty = EXCLUDED.max_qty, qty_step = EXCLUDED.qty_step, updated_at = NOW()`,
+          [
+            productId,
+            u.unit,
+            u.factor ?? 1,
+            u.is_base ?? false,
+            u.is_purchase_default ?? false,
+            u.price_override ?? null,
+            u.display_label ?? null,
+            u.notes ?? null,
+            u.dimension ?? 'count',
+            u.conversion_meta ?? null,
+            u.sub_variant_id,
+            u.min_qty ?? 1,
+            u.max_qty ?? null,
+            u.qty_step ?? 1,
+            u.variant_id && u.variant_id !== 'null' ? u.variant_id : null,
+          ]
+        )
+        await client.query('RELEASE SAVEPOINT sv_unit')
+      } catch (e: any) {
+        await client.query('ROLLBACK TO SAVEPOINT sv_unit')
+        if (e?.code !== '23505') throw e // only swallow unique-violation cross-scope collisions
+        // Collided with a product-level (or other) row on (product_id, unit). Update
+        // the existing sub-variant unit in place if one exists; else leave it — a
+        // product-level unit of the same name already covers this grain.
+        await client.query(
+          `UPDATE product_units SET
+             factor = $3, is_base = $4, is_purchase_default = $5, price_override = $6,
+             display_label = $7, notes = $8, dimension = $9, conversion_meta = $10,
+             min_qty = $11, max_qty = $12, qty_step = $13, updated_at = NOW()
+           WHERE product_id = $1 AND sub_variant_id = $2 AND unit = $14`,
+          [
+            productId,
+            u.sub_variant_id,
+            u.factor ?? 1,
+            u.is_base ?? false,
+            u.is_purchase_default ?? false,
+            u.price_override ?? null,
+            u.display_label ?? null,
+            u.notes ?? null,
+            u.dimension ?? 'count',
+            u.conversion_meta ?? null,
+            u.min_qty ?? 1,
+            u.max_qty ?? null,
+            u.qty_step ?? 1,
+            u.unit,
+          ]
+        )
+      }
+    }
+
+    // ── Selling-unit override: wipe stock at flagged grains ───────────────────
+    // An admin confirmed changing the base unit despite stock. Runs AFTER the unit
+    // upserts so the inherit checks see the new units, and BEFORE any final stock
+    // recompute. In-stock serials, batches and shelf are deleted; inventory set to 0
+    // at the grain and every child that inherits it. Sold/reserved serials are kept.
+    for (const scope of scopesToWipe(units as any[])) {
+      await wipeStockForScope(client, productId, scope)
+    }
+
+    // ── Toggle-OFF cleanup: perishable/serialized turned OFF ──────────────────
+    // When a tracking flag is turned off, delete the now-orphaned batch/serial (and
+    // their shelf) records but PRESERVE the stock by rolling the on-hand count back
+    // into plain inventory_quantity at the correct grain. Runs AFTER the variant /
+    // sub-variant upserts above (which set inventory from the draft snapshot) so this
+    // is the final authority on the toggled-off grains. Counts are captured BEFORE
+    // any delete. Only in_stock serials / remaining batch qty count as live stock;
+    // sold/reserved serials are FK-referenced by orders and are left untouched.
+    if (turnedOffPerishable || turnedOffSerialized) {
+      // Per-grain on-hand count, captured BEFORE deleting. A grain may be tracked by
+      // batches (perishable), serials (serialized), or both — and for a both-flags
+      // product a batch of N carries N serials for the same units. So the true count
+      // per grain is the GREATER of the two sources being removed (they should be
+      // equal; MAX also covers a grain tracked by only one). We only include a source
+      // when that flag is actually turning off, so a still-active tracking type is
+      // never double-counted or wrongly dropped.
+      //   batchExpr  → SUM(product_batches.quantity_remaining) when perishable off
+      //   serialExpr → COUNT(product_serials in_stock)         when serialized off
+      // Combined via a UNION-based subquery aggregated per grain with GREATEST.
+      const sources: string[] = []
+      if (turnedOffPerishable) {
+        sources.push(`SELECT variant_id, sub_variant_id, COALESCE(quantity_remaining,0)::numeric AS q
+                      FROM product_batches WHERE product_id = $1`)
+      }
+      if (turnedOffSerialized) {
+        sources.push(`SELECT variant_id, sub_variant_id, 1::numeric AS q
+                      FROM product_serials WHERE product_id = $1 AND status = 'in_stock'`)
+      }
+      // Each source contributes its own per-grain SUM; take the max across sources so
+      // a batch(N)+serials(N) grain reads N (not 2N), and a single-source grain reads N.
+      const unioned = sources
+        .map(
+          (s, i) =>
+            `SELECT variant_id, sub_variant_id, SUM(q) AS total FROM (${s}) src${i} GROUP BY variant_id, sub_variant_id`
+        )
+        .join(' UNION ALL ')
+      const perGrain = await client.query<{
+        variant_id: string | null
+        sub_variant_id: string | null
+        total: string
+      }>(
+        `SELECT variant_id, sub_variant_id, MAX(total)::text AS total
+         FROM (${unioned}) u GROUP BY variant_id, sub_variant_id`,
+        [productId]
+      )
+      const subCounts = {
+        rows: perGrain.rows
+          .filter(r => r.sub_variant_id)
+          .map(r => ({ sub_variant_id: r.sub_variant_id as string, total: r.total })),
+      }
+      const varCounts = {
+        rows: perGrain.rows
+          .filter(r => r.variant_id && !r.sub_variant_id)
+          .map(r => ({ variant_id: r.variant_id as string, total: r.total })),
+      }
+      const prodTotal = perGrain.rows.find(r => !r.variant_id && !r.sub_variant_id)?.total ?? '0'
+      const prodCount = { rows: [{ total: prodTotal }] }
+
+      // Delete tracking records. Perishable-off drops batches; serialized-off drops
+      // in_stock serials (never sold/reserved). If BOTH are now off, drop both.
+      if (turnedOffSerialized) {
+        await client.query(`DELETE FROM product_serials WHERE product_id = $1 AND status = 'in_stock'`, [productId])
+      }
+      // Batches back BOTH tracking kinds (serials hang off them), so they go only when
+      // no tracking remains. A still-serialized product keeps its batches and shelf
+      // rows; only the expiry, which no longer applies, is cleared.
+      if (!newPerishable && !newSerialized) {
+        await client.query(`DELETE FROM product_batches WHERE product_id = $1`, [productId])
+        await client.query(`DELETE FROM shelf_stock WHERE product_id = $1`, [productId])
+      } else if (!newPerishable) {
+        await client.query(`UPDATE product_batches SET expiry_date = NULL, updated_at = NOW() WHERE product_id = $1`, [
+          productId,
+        ])
+      }
+
+      // Roll counts back into plain inventory at the correct grain.
+      for (const sv of subCounts.rows) {
+        await client.query(
+          `UPDATE product_sub_variants SET inventory_quantity = $1, stock_status = $2, updated_at = NOW() WHERE id = $3`,
+          [parseFloat(sv.total) || 0, (parseFloat(sv.total) || 0) > 0 ? 'In Stock' : 'Out of Stock', sv.sub_variant_id]
+        )
+      }
+      for (const v of varCounts.rows) {
+        // A variant with active sub-variants derives its qty from their rollup;
+        // otherwise it takes its own captured count.
+        await client.query(
+          `UPDATE product_variants pv SET inventory_quantity = CASE
+             WHEN EXISTS (SELECT 1 FROM product_sub_variants sv WHERE sv.variant_id = pv.id AND sv.is_active = true)
+             THEN COALESCE((SELECT SUM(sv.inventory_quantity) FROM product_sub_variants sv WHERE sv.variant_id = pv.id AND sv.is_active = true), 0)
+             ELSE $1 END,
+             updated_at = NOW()
+           WHERE pv.id = $2`,
+          [parseFloat(v.total) || 0, v.variant_id]
+        )
+      }
+      // Ensure variants that only have sub-variant grains still roll up correctly.
+      await client.query(
+        `UPDATE product_variants pv SET inventory_quantity = COALESCE(
+           (SELECT SUM(sv.inventory_quantity) FROM product_sub_variants sv WHERE sv.variant_id = pv.id AND sv.is_active = true), pv.inventory_quantity)
+         WHERE pv.product_id = $1
+           AND EXISTS (SELECT 1 FROM product_sub_variants sv WHERE sv.variant_id = pv.id AND sv.is_active = true)`,
+        [productId]
+      )
+      // Product-level inventory: rollup of active variants for a variant product,
+      // else its own captured count. Derive "is a variant product" from STRUCTURE
+      // (does it have any active variant?), NOT from whether grains happened to have
+      // stock — otherwise a variant product whose grains are all at zero at toggle
+      // time would be misclassified as simple and force products.inventory_quantity=0,
+      // clobbering the correct variant rollup.
+      const structRow = await client.query<{ has_active_variant: boolean }>(
+        `SELECT EXISTS(SELECT 1 FROM product_variants WHERE product_id = $1 AND is_active = true) AS has_active_variant`,
+        [productId]
+      )
+      const isVariantProduct = !!structRow.rows[0]?.has_active_variant
+      if (isVariantProduct) {
+        await client.query(
+          `UPDATE products SET inventory_quantity = COALESCE(
+             (SELECT SUM(inventory_quantity) FROM product_variants WHERE product_id = $1 AND is_active = true), 0),
+             updated_at = NOW() WHERE id = $1`,
+          [productId]
+        )
+      } else {
+        await client.query(`UPDATE products SET inventory_quantity = $1, updated_at = NOW() WHERE id = $2`, [
+          parseFloat(prodCount.rows[0]?.total ?? '0') || 0,
+          productId,
+        ])
+      }
+    }
+
+    // Media staged in the Media tab wins; otherwise product_media follows the image tables just written.
+    const stagedMedia = parseStaged((draft.fields as any)?._media)
+    if (stagedMedia && Array.isArray(stagedMedia.items)) await applyProductMediaTx(client, productId, stagedMedia)
+    else {
+      // The image tables already logged this change.
+      await client.query(`SELECT set_config('audit.skip', 'true', true)`)
+      await syncLegacyImagesToMedia(productId, client)
+      await client.query(`SELECT set_config('audit.skip', '', true)`)
+    }
+    const stagedFaqs = parseStaged((draft.fields as any)?._faqs)
+    if (Array.isArray(stagedFaqs)) await applyProductFaqsTx(client, productId, stagedFaqs)
+
+    // Keep "Has sub-variants" honest: ON iff the variant still has active sub-variants.
+    await client.query(
+      `UPDATE product_variants pv SET sub_variant_type_on = sub.has_subs, updated_at = NOW()
+       FROM (SELECT v.id, EXISTS (SELECT 1 FROM product_sub_variants sv
+                                  WHERE sv.variant_id = v.id AND sv.is_active = true) AS has_subs
+             FROM product_variants v WHERE v.product_id = $1) sub
+       WHERE pv.id = sub.id AND pv.sub_variant_type_on IS DISTINCT FROM sub.has_subs`,
+      [productId]
+    )
+
+    // If inventory_sync is ON for this product, derive stock_status from the final
+    // quantities at every grain (backfill on flag flip + steady-state on each
+    // publish). No-op when OFF, so the manual stock_status written above stands.
+    if (newDigital) await normalizeDigitalProduct(client, productId)
+    await recomputeStockStatusForProduct(client, productId)
+
+    if (merge)
+      revision = await recordRevision(client as unknown as DraftDb, {
+        type: 'product',
+        id: productId,
+        before: merge.before,
+        after: merge.after,
+        actorAdminId: opts.actor?.adminId,
+        draftId,
+        draftTitle: draft.title ?? null,
+        source: opts.actor ? 'publish' : 'import',
+      })
+    // Digital files: this draft's uploads go live with it; its removals and toggles apply now.
+    await client.query(`UPDATE product_files SET draft_id = NULL, updated_at = now() WHERE draft_id = $1`, [draftId])
+    removedFiles = await applyDraftFileOpsTx(client, productId, (draft.fields as any)?._files)
+    await client.query(`DELETE FROM product_drafts WHERE id = $1`, [draftId])
+    closed = await closeDraftLockTx(client, opts.actor, 'product', draftId, 'published')
+    siblings = (await client.query(`SELECT id, author_admin_id FROM product_drafts WHERE product_id = $1`, [productId])).rows
+  }).catch(err => {
+    if (isDraftLockError(err) || err instanceof StaleMergeError) throw err
+    const friendly = friendlyProductDbError(err)
+    if (friendly) throw new ProductValidationError(friendly, { cause: err })
+    throw err
+  })
+  // The draft is gone: an open edit session would otherwise be resumed against the next draft.
+  try {
+    await query(
+      `UPDATE editor_sessions SET closed_at = now(), closed_reason = 'save'
+        WHERE resource_type = 'product' AND resource_id = $1 AND closed_at IS NULL`,
+      [draftId]
+    )
+  } catch (e) {
+    console.error('[product-draft] closing edit sessions failed for', productId, e)
+  }
+  await announceDraftClosed(opts.actor, 'product', draftId, closed, 'published')
+  await releaseFileObjects(removedFiles)
+  if (revision != null) await notifyDraftSiblings('product', opts.actor, productId, draft.title ?? null, siblings)
+  const keptForHistory = purged.flatMap(p => p.deactivated)
+  if (keptForHistory.length > 0)
+    console.warn('[product-draft] toggled-off rows kept (deactivated) for history on', productId, keptForHistory)
+  return { keptForHistory }
+}

@@ -1,0 +1,1068 @@
+import { describe, it, expect, beforeEach, vi } from 'vitest'
+
+vi.mock('@/lib/shared/db', () => ({
+  query: vi.fn(),
+  queryMany: vi.fn(),
+  queryOne: vi.fn(),
+}))
+vi.mock('@/lib/queries', () => ({
+  VARIANT_MIN_PRICE_SQL: 'NULL',
+  EFFECTIVE_STOCK_SQL: 'COALESCE(stock, 0)',
+}))
+vi.mock('@/lib/shared/rag', () => ({
+  embed: vi.fn().mockResolvedValue([0.1, 0.2, 0.3]),
+  findSimilarProductIds: vi.fn(),
+  queryManyReplica: vi.fn(),
+  runWithHnswTuning: vi.fn(),
+}))
+vi.mock('@/lib/admin-agent/pdf', () => ({
+  pdfText: vi.fn(),
+  pdfPageImages: vi.fn(),
+}))
+vi.mock('@/lib/admin-agent/vision', () => ({
+  ocrImage: vi.fn(),
+  ocrPdfPages: vi.fn(),
+  isVisionConfigured: vi.fn(),
+}))
+vi.mock('@/lib/shared/ai-client', () => ({
+  aiChat: vi.fn(),
+}))
+vi.mock('@/lib/catalog/site-controls', () => ({
+  getFeatureFlags: vi.fn(),
+}))
+
+import { SALES_TOOLS, autoQuotationItems } from '@/lib/admin-agent/tools/sales'
+import * as siteControls from '@/lib/catalog/site-controls'
+import * as db from '@/lib/shared/db'
+import * as rag from '@/lib/shared/rag'
+import * as vision from '@/lib/admin-agent/vision'
+import * as pdf from '@/lib/admin-agent/pdf'
+import * as aiClient from '@/lib/shared/ai-client'
+
+const mockQueryMany = vi.mocked(db.queryMany)
+const mockQueryOne = vi.mocked(db.queryOne)
+const mockQuery = vi.mocked(db.query)
+const mockEmbed = vi.mocked(rag.embed)
+const mockQueryManyReplica = vi.mocked(rag.queryManyReplica)
+const mockRunWithHnswTuning = vi.mocked(rag.runWithHnswTuning)
+const mockOcrPdfPages = vi.mocked(vision.ocrPdfPages)
+const mockOcrImage = vi.mocked(vision.ocrImage)
+const mockAiChat = vi.mocked(aiClient.aiChat)
+
+function getTool(name: string) {
+  const tool = SALES_TOOLS.find(t => t.name === name)
+  if (!tool) throw new Error(`Tool "${name}" not found in SALES_TOOLS`)
+  return tool
+}
+
+// ── list_quotations ───────────────────────────────────────────────────────────
+
+describe('list_quotations', () => {
+  beforeEach(() => vi.resetAllMocks())
+
+  it('returns quotations with default params', async () => {
+    const rows = [{ id: 'q1', quote_number: 'QT-001', status: 'draft' }]
+    mockQueryMany.mockResolvedValueOnce(rows)
+    const result = (await getTool('list_quotations').handler({})) as any
+    expect(result.quotations).toEqual(rows)
+    expect(result.count).toBe(1)
+    expect(result.truncated).toBe(false)
+  })
+
+  it('truncated=true when rows.length equals clamped limit', async () => {
+    mockQueryMany.mockResolvedValueOnce(Array(20).fill({ id: 'q' }))
+    const result = (await getTool('list_quotations').handler({})) as any
+    expect(result.truncated).toBe(true) // 20 rows === default limit 20
+  })
+
+  it('clamps limit above 100 to 100', async () => {
+    mockQueryMany.mockResolvedValueOnce(Array(100).fill({ id: 'q' }))
+    const result = (await getTool('list_quotations').handler({ limit: 9999 })) as any
+    expect(result.truncated).toBe(true) // 100 rows === clamped limit 100
+  })
+
+  it('clamps limit below 1 to 1', async () => {
+    mockQueryMany.mockResolvedValueOnce([])
+    await getTool('list_quotations').handler({ limit: 0 })
+    expect(mockQueryMany).toHaveBeenCalled()
+  })
+
+  it('clamps daysBack above 365 to 365', async () => {
+    mockQueryMany.mockResolvedValueOnce([])
+    await getTool('list_quotations').handler({ daysBack: 9999 })
+    expect(mockQueryMany).toHaveBeenCalled()
+  })
+
+  it('clamps daysBack below 1 to 1', async () => {
+    mockQueryMany.mockResolvedValueOnce([])
+    await getTool('list_quotations').handler({ daysBack: 0 })
+    expect(mockQueryMany).toHaveBeenCalled()
+  })
+
+  it('adds status WHERE clause when status provided', async () => {
+    mockQueryMany.mockResolvedValueOnce([])
+    await getTool('list_quotations').handler({ status: 'draft' })
+    const sql = mockQueryMany.mock.calls[0][0] as string
+    expect(sql).toContain('q.status =')
+  })
+
+  it('adds customerId ILIKE clause when customerId provided', async () => {
+    mockQueryMany.mockResolvedValueOnce([])
+    await getTool('list_quotations').handler({ customerId: 'alice' })
+    const sql = mockQueryMany.mock.calls[0][0] as string
+    expect(sql).toContain('ILIKE')
+  })
+
+  it('applies both filters together', async () => {
+    mockQueryMany.mockResolvedValueOnce([])
+    await getTool('list_quotations').handler({ status: 'final', customerId: 'bob' })
+    const sql = mockQueryMany.mock.calls[0][0] as string
+    expect(sql).toContain('q.status =')
+    expect(sql).toContain('ILIKE')
+  })
+})
+
+// ── get_quotation ─────────────────────────────────────────────────────────────
+
+describe('get_quotation', () => {
+  beforeEach(() => vi.resetAllMocks())
+
+  it('throws when neither id nor quoteNumber provided', async () => {
+    await expect(getTool('get_quotation').handler({})).rejects.toThrow('Provide id or quoteNumber')
+  })
+
+  it('returns { error } when quotation not found', async () => {
+    mockQueryOne.mockResolvedValueOnce(null)
+    const result = (await getTool('get_quotation').handler({ id: 'missing' })) as any
+    expect(result.error).toBe('Quotation not found')
+  })
+
+  it('returns quotation spread with items array when found by id', async () => {
+    mockQueryOne.mockResolvedValueOnce({ id: 'q1', quote_number: 'QT-001', status: 'draft' })
+    mockQueryMany.mockResolvedValueOnce([{ position: 1, description: 'Bolt M20' }])
+    const result = (await getTool('get_quotation').handler({ id: 'q1' })) as any
+    expect(result.id).toBe('q1')
+    expect(result.quote_number).toBe('QT-001')
+    expect(result.items).toHaveLength(1)
+    expect(result.error).toBeUndefined()
+  })
+
+  it('returns quotation when found by quoteNumber', async () => {
+    mockQueryOne.mockResolvedValueOnce({ id: 'q2', quote_number: 'QT-002', status: 'final' })
+    mockQueryMany.mockResolvedValueOnce([])
+    const result = (await getTool('get_quotation').handler({ quoteNumber: 'QT-002' })) as any
+    expect(result.quote_number).toBe('QT-002')
+    expect(result.items).toHaveLength(0)
+  })
+
+  it('returns empty items array when no line items exist', async () => {
+    mockQueryOne.mockResolvedValueOnce({ id: 'q3', quote_number: 'QT-003' })
+    mockQueryMany.mockResolvedValueOnce([])
+    const result = (await getTool('get_quotation').handler({ id: 'q3' })) as any
+    expect(result.items).toEqual([])
+  })
+})
+
+// ── list_invoices ─────────────────────────────────────────────────────────────
+
+describe('list_invoices', () => {
+  beforeEach(() => vi.resetAllMocks())
+
+  it('returns invoices with default params', async () => {
+    mockQueryMany.mockResolvedValueOnce([{ id: 'inv1', invoice_number: 'INV-001' }])
+    const result = (await getTool('list_invoices').handler({})) as any
+    expect(result.invoices).toHaveLength(1)
+    expect(result.count).toBe(1)
+    expect(result.truncated).toBe(false)
+  })
+
+  it('truncated=true when rows fill the limit', async () => {
+    mockQueryMany.mockResolvedValueOnce(Array(20).fill({ id: 'i' }))
+    const result = (await getTool('list_invoices').handler({})) as any
+    expect(result.truncated).toBe(true)
+  })
+
+  it('adds payment_status filter when status provided', async () => {
+    mockQueryMany.mockResolvedValueOnce([])
+    await getTool('list_invoices').handler({ status: 'paid' })
+    const sql = mockQueryMany.mock.calls[0][0] as string
+    expect(sql).toContain('o.payment_status =')
+  })
+
+  it('adds customer ILIKE filter when customerId provided', async () => {
+    mockQueryMany.mockResolvedValueOnce([])
+    await getTool('list_invoices').handler({ customerId: 'corp' })
+    const sql = mockQueryMany.mock.calls[0][0] as string
+    expect(sql).toContain('ILIKE')
+  })
+
+  it('clamps limit and daysBack', async () => {
+    mockQueryMany.mockResolvedValueOnce([])
+    await getTool('list_invoices').handler({ limit: 500, daysBack: 1000 })
+    expect(mockQueryMany).toHaveBeenCalled()
+  })
+})
+
+// ── get_invoice ───────────────────────────────────────────────────────────────
+
+describe('get_invoice', () => {
+  beforeEach(() => vi.resetAllMocks())
+
+  it('throws when neither id nor invoiceNumber provided', async () => {
+    await expect(getTool('get_invoice').handler({})).rejects.toThrow('Provide id or invoiceNumber')
+  })
+
+  it('returns { error } when invoice not found', async () => {
+    mockQueryOne.mockResolvedValueOnce(null)
+    const result = (await getTool('get_invoice').handler({ invoiceNumber: 'INV-999' })) as any
+    expect(result.error).toBe('Invoice not found')
+  })
+
+  it('returns invoice spread with items when found by id', async () => {
+    mockQueryOne.mockResolvedValueOnce({ id: 'inv1', invoice_number: 'INV-001', payment_status: 'unpaid' })
+    mockQueryMany.mockResolvedValueOnce([{ product_name: 'Bolt', quantity: '10' }])
+    const result = (await getTool('get_invoice').handler({ id: 'inv1' })) as any
+    expect(result.invoice_number).toBe('INV-001')
+    expect(result.items).toHaveLength(1)
+    expect(result.error).toBeUndefined()
+  })
+
+  it('returns invoice when found by invoiceNumber', async () => {
+    mockQueryOne.mockResolvedValueOnce({ id: 'inv2', invoice_number: 'INV-002' })
+    mockQueryMany.mockResolvedValueOnce([])
+    const result = (await getTool('get_invoice').handler({ invoiceNumber: 'INV-002' })) as any
+    expect(result.id).toBe('inv2')
+  })
+})
+
+// ── list_cash_sales ───────────────────────────────────────────────────────────
+
+describe('list_cash_sales', () => {
+  beforeEach(() => vi.resetAllMocks())
+
+  it('returns cash sales with default params', async () => {
+    mockQueryMany.mockResolvedValueOnce([{ id: 'cs1', sale_number: 'CS-001' }])
+    const result = (await getTool('list_cash_sales').handler({})) as any
+    expect(result.sales).toHaveLength(1)
+    expect(result.count).toBe(1)
+    expect(result.truncated).toBe(false)
+  })
+
+  it('truncated=true when rows fill the limit', async () => {
+    mockQueryMany.mockResolvedValueOnce(Array(20).fill({ id: 'cs' }))
+    const result = (await getTool('list_cash_sales').handler({})) as any
+    expect(result.truncated).toBe(true)
+  })
+
+  it('clamps limit to 100 and daysBack to 365', async () => {
+    mockQueryMany.mockResolvedValueOnce([])
+    await getTool('list_cash_sales').handler({ limit: 500, daysBack: 999 })
+    expect(mockQueryMany).toHaveBeenCalled()
+  })
+})
+
+// ── get_cash_sale ─────────────────────────────────────────────────────────────
+
+describe('get_cash_sale', () => {
+  beforeEach(() => vi.resetAllMocks())
+
+  it('throws when none of id, saleNumber, invoiceNumber provided', async () => {
+    await expect(getTool('get_cash_sale').handler({})).rejects.toThrow('Provide id, saleNumber, or invoiceNumber')
+  })
+
+  it('returns { error } when sale not found', async () => {
+    mockQueryOne.mockResolvedValueOnce(null)
+    const result = (await getTool('get_cash_sale').handler({ saleNumber: 'CS-999' })) as any
+    expect(result.error).toBe('Cash sale not found')
+  })
+
+  it('returns sale with items when found by id', async () => {
+    mockQueryOne.mockResolvedValueOnce({ id: 'cs1', sale_number: 'CS-001' })
+    mockQueryMany.mockResolvedValueOnce([{ product_name: 'Bolt' }])
+    const result = (await getTool('get_cash_sale').handler({ id: 'cs1' })) as any
+    expect(result.sale_number).toBe('CS-001')
+    expect(result.items).toHaveLength(1)
+    expect(result.error).toBeUndefined()
+  })
+
+  it('finds sale by saleNumber', async () => {
+    mockQueryOne.mockResolvedValueOnce({ id: 'cs2', sale_number: 'CS-002' })
+    mockQueryMany.mockResolvedValueOnce([])
+    const result = (await getTool('get_cash_sale').handler({ saleNumber: 'CS-002' })) as any
+    expect(result.sale_number).toBe('CS-002')
+  })
+
+  it('finds sale by invoiceNumber', async () => {
+    mockQueryOne.mockResolvedValueOnce({ id: 'cs3', sale_number: 'CS-003', invoice_number: 'INV-CS-003' })
+    mockQueryMany.mockResolvedValueOnce([])
+    const result = (await getTool('get_cash_sale').handler({ invoiceNumber: 'INV-CS-003' })) as any
+    expect(result.id).toBe('cs3')
+  })
+})
+
+// ── match_quotation_items ─────────────────────────────────────────────────────
+
+describe('match_quotation_items', () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+    // Default: tiebreaker returns null → JS aggregate score is used as-is
+    mockAiChat.mockResolvedValue({
+      content: 'null',
+      provider: 'openai',
+      model: 'gpt-4o',
+      latencyMs: 0,
+      fallbackUsed: false,
+    })
+    // Default: no HNSW results
+    mockRunWithHnswTuning.mockResolvedValue({ rows: [] } as any)
+    // Default: text-fallback queryMany returns empty (reached when HNSW returns no candidates)
+    mockQueryMany.mockResolvedValue([])
+  })
+
+  it('returns err for invalid JSON', async () => {
+    const result = (await getTool('match_quotation_items').handler({ lines: 'not json' })) as any
+    expect(result.ok).toBe(false)
+    expect(result.summary).toMatch(/Invalid lines payload/i)
+  })
+
+  it('returns err when lines parses to non-array', async () => {
+    const result = (await getTool('match_quotation_items').handler({ lines: '{"foo":"bar"}' })) as any
+    expect(result.ok).toBe(false)
+  })
+
+  it('returns err for empty array', async () => {
+    const result = (await getTool('match_quotation_items').handler({ lines: '[]' })) as any
+    expect(result.ok).toBe(false)
+    expect(result.summary).toMatch(/No lines provided/i)
+  })
+
+  it('returns err for more than 50 lines', async () => {
+    const lines = JSON.stringify(Array(51).fill({ requestedText: 'bolt', qty: 1 }))
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.ok).toBe(false)
+    expect(result.summary).toMatch(/Too many lines/i)
+  })
+
+  it('marks line unmatched when requestedText is empty string', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    const lines = JSON.stringify([{ requestedText: '', qty: 1 }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.ok).toBe(true)
+    expect(result.data.lines[0].status).toBe('unmatched')
+  })
+
+  it('marks line unmatched when qty is 0', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    const lines = JSON.stringify([{ requestedText: 'bolt', qty: 0 }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.data.lines[0].status).toBe('unmatched')
+  })
+
+  it('marks line unmatched when qty is negative', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    const lines = JSON.stringify([{ requestedText: 'bolt', qty: -5 }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.data.lines[0].status).toBe('unmatched')
+  })
+
+  it('marks line unmatched when qty is NaN (non-numeric string)', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    const lines = JSON.stringify([{ requestedText: 'bolt', qty: 'abc' }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.data.lines[0].status).toBe('unmatched')
+  })
+
+  it('returns unmatched when embeddings query returns empty', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    const lines = JSON.stringify([{ requestedText: 'obscure item nobody sells', qty: 1 }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.data.lines[0].status).toBe('unmatched')
+    expect(result.data.counts.unmatched).toBe(1)
+  })
+
+  it('returns unmatched when top candidate sim < 0.45', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    // embeddings query → low sim product
+    mockRunWithHnswTuning.mockResolvedValueOnce({
+      rows: [{ source_table: 'products', source_id: 'p1', sim: 0.3 }],
+    } as any)
+    mockQueryMany.mockResolvedValueOnce([{ id: 'p1', name: 'Widget', sku: 'W1', price: 50 }])
+    const lines = JSON.stringify([{ requestedText: 'unrelated item', qty: 1 }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.data.lines[0].status).toBe('unmatched')
+  })
+
+  it('returns matched when top sim >= threshold with single candidate', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    // embeddings returns 1 product result with high sim; no variants
+    mockRunWithHnswTuning.mockResolvedValueOnce({
+      rows: [{ source_table: 'products', source_id: 'p1', sim: 0.9 }],
+    } as any)
+    mockQueryMany.mockResolvedValueOnce([{ id: 'p1', name: 'Bolt M20', sku: 'BOLT-M20', price: 100 }])
+    const lines = JSON.stringify([{ requestedText: 'M20 bolt', qty: 5 }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.data.lines[0].status).toBe('matched')
+    expect(result.data.counts.matched).toBe(1)
+  })
+
+  it('returns matched when score ≥ 90 and lead ≥ 5 over second', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    // p1: sim=0.92, name='Bolt M20', query='bolt m20'
+    //   → embedding=0.92, tokenOverlap=1.0 (both tokens hit), specNum=0.5 (neutral, no numeric specs), skuFrag=0.5 (neutral)
+    //   → score=round((0.92*0.50 + 1.0*0.20 + 0.5*0.20 + 0.5*0.10)*100)=round(0.66*100)=66... no, m20 IS a spec
+    //   → specNum: qSpecs={'m20'}, nSpecs={'m20'} → hits=1 → specNum=1.0
+    //   → score=round((0.92*0.50 + 1.0*0.20 + 1.0*0.20 + 0.5*0.10)*100)=round(0.91*100)=91 → ≥90
+    // p2: sim=0.75, name='Bolt M16', query='bolt m20'
+    //   → specNum: qSpecs={'m20'}, nSpecs={'m16'} → hits=0 → specNum=0
+    //   → tokenOverlap: q={'bolt','m20'}, n={'bolt','m16'} → hits=1/2=0.5
+    //   → score=round((0.75*0.50 + 0.5*0.20 + 0.0*0.20 + 0.5*0.10)*100)=round(0.53*100)=53
+    // lead=91-53=38 ≥ 5 → matched
+    mockRunWithHnswTuning.mockResolvedValueOnce({
+      rows: [
+        { source_table: 'products', source_id: 'p1', sim: 0.92 },
+        { source_table: 'products', source_id: 'p2', sim: 0.75 },
+      ],
+    } as any)
+    mockQueryMany.mockResolvedValueOnce([
+      { id: 'p1', name: 'Bolt M20', sku: 'BOLT-M20', price: 100 },
+      { id: 'p2', name: 'Bolt M16', sku: 'BOLT-M16', price: 90 },
+    ])
+    const lines = JSON.stringify([{ requestedText: 'bolt m20', qty: 10 }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.data.lines[0].status).toBe('matched')
+  })
+
+  it('returns ambiguous when two candidates are close in score', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    // sim 0.82 vs 0.80 — diff 0.02 < 0.05, both >= 0.45, top >= default threshold 0.62
+    mockRunWithHnswTuning.mockResolvedValueOnce({
+      rows: [
+        { source_table: 'products', source_id: 'p1', sim: 0.82 },
+        { source_table: 'products', source_id: 'p2', sim: 0.8 },
+      ],
+    } as any)
+    mockQueryMany.mockResolvedValueOnce([
+      { id: 'p1', name: 'Bolt M20', sku: 'BOLT-M20', price: 100 },
+      { id: 'p2', name: 'Bolt M22', sku: 'BOLT-M22', price: 105 },
+    ])
+    const lines = JSON.stringify([{ requestedText: 'bolt', qty: 1 }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.data.lines[0].status).toBe('ambiguous')
+    expect(result.data.counts.ambiguous).toBe(1)
+  })
+
+  it('returns ambiguous when top sim is between 0.45 and threshold', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    // sim 0.55 < default threshold 0.62, but >= 0.45 → ambiguous
+    mockRunWithHnswTuning.mockResolvedValueOnce({
+      rows: [{ source_table: 'products', source_id: 'p1', sim: 0.55 }],
+    } as any)
+    mockQueryMany.mockResolvedValueOnce([{ id: 'p1', name: 'Bolt', sku: 'B', price: 80 }])
+    const lines = JSON.stringify([{ requestedText: 'some bolt', qty: 2 }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.data.lines[0].status).toBe('ambiguous')
+  })
+
+  it('handles product_variants source_table — resolves via variant→product mapping', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    // sim=0.95, name='Bolt M20', query='bolt m20' → specNum=1.0 (m20 matches), tokenOverlap=1.0, skuFrag=0.5
+    // score=round((0.95*0.50 + 1.0*0.20 + 1.0*0.20 + 0.5*0.10)*100) = round(0.925*100) = 93 → matched
+    mockRunWithHnswTuning.mockResolvedValueOnce({
+      rows: [{ source_table: 'product_variants', source_id: 'v1', sim: 0.95 }],
+    } as any)
+    mockQueryMany
+      .mockResolvedValueOnce([{ id: 'v1', product_id: 'p1' }])
+      .mockResolvedValueOnce([{ id: 'p1', name: 'Bolt M20', sku: 'BOLT-V', price: 120 }])
+    const lines = JSON.stringify([{ requestedText: 'bolt m20', qty: 25 }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.data.lines[0].status).toBe('matched')
+  })
+
+  it('handles mix of products and variants in same embeddings result', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    mockRunWithHnswTuning.mockResolvedValueOnce({
+      rows: [
+        { source_table: 'products', source_id: 'p1', sim: 0.88 },
+        { source_table: 'product_variants', source_id: 'v1', sim: 0.86 },
+      ],
+    } as any)
+    mockQueryMany
+      .mockResolvedValueOnce([{ id: 'v1', product_id: 'p2' }]) // variant → p2
+      .mockResolvedValueOnce([
+        { id: 'p1', name: 'Bolt Direct', sku: 'BD', price: 100 },
+        { id: 'p2', name: 'Bolt Via Variant', sku: 'BV', price: 110 },
+      ])
+    const lines = JSON.stringify([{ requestedText: 'bolt item', qty: 3 }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    // p1 sim=0.88, p2 sim=0.86 → scores close → ambiguous
+    expect(result.data.lines[0].status).toBe('ambiguous')
+  })
+
+  it('score ≥ 90 with exact text match and high sim → matched (haiku tiebreaker lifts score)', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    // sim=0.92, query='widget', name='Widget'
+    // JS score ≈ 76 (no numeric specs → specNum=0.5 neutral, skuFrag=0.5 neutral)
+    // haiku tiebreaker fires (76 is in ambiguous band 45–89) and returns 95 → matched
+    mockAiChat.mockResolvedValueOnce({
+      content: '95',
+      provider: 'openai',
+      model: 'gpt-4o',
+      latencyMs: 0,
+      fallbackUsed: false,
+    })
+    mockRunWithHnswTuning.mockResolvedValueOnce({
+      rows: [{ source_table: 'products', source_id: 'p1', sim: 0.92 }],
+    } as any)
+    mockQueryMany.mockResolvedValueOnce([{ id: 'p1', name: 'Widget', sku: 'W', price: 50 }])
+    const lines = JSON.stringify([{ requestedText: 'widget', qty: 1 }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.data.lines[0].status).toBe('matched')
+    expect(result.data.lines[0].candidates[0].score).toBeGreaterThanOrEqual(90)
+  })
+
+  it('score 45–89 → ambiguous (moderate sim, no token/spec overlap)', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    // sim=0.75, query='bolt', name='SomeWidget'
+    // tokenOverlap=0, specNum=0.5 (neutral, no numeric specs), skuFrag=0.5 (neutral)
+    // score=round((0.75*0.50 + 0*0.20 + 0.5*0.20 + 0.5*0.10)*100)=round(0.525*100)=53 → ambiguous band
+    // haiku fires (53 in 45–89), returns null (default mock) → stays 53
+    mockRunWithHnswTuning.mockResolvedValueOnce({
+      rows: [{ source_table: 'products', source_id: 'p1', sim: 0.75 }],
+    } as any)
+    mockQueryMany.mockResolvedValueOnce([{ id: 'p1', name: 'SomeWidget', sku: 'W', price: 50 }])
+    const lines = JSON.stringify([{ requestedText: 'bolt', qty: 1 }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.data.lines[0].status).toBe('ambiguous')
+    expect(result.data.lines[0].candidates[0].score).toBeGreaterThanOrEqual(45)
+    expect(result.data.lines[0].candidates[0].score).toBeLessThan(90)
+  })
+
+  it('returns ok with summary counts across multiple lines', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    // Line 1: no embeddings → unmatched
+    // Line 2: empty text → unmatched (skips embed)
+    mockRunWithHnswTuning.mockResolvedValueOnce({ rows: [] } as any) // line 1 embeddings
+    const lines = JSON.stringify([
+      { requestedText: 'unknown', qty: 1 },
+      { requestedText: '', qty: 1 },
+    ])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.ok).toBe(true)
+    expect(result.count).toBe(2)
+    expect(result.data.counts.unmatched).toBe(2)
+  })
+})
+
+// ── propose_create_quotation ──────────────────────────────────────────────────
+
+describe('propose_create_quotation', () => {
+  beforeEach(() => vi.resetAllMocks())
+
+  const PRODUCT_ID = '550e8400-e29b-41d4-a716-446655440001'
+
+  it('throws when customerEmail has no @', async () => {
+    await expect(
+      getTool('propose_create_quotation').handler({
+        customerEmail: 'notanemail',
+        items: '[{"productId":"p1","quantity":1}]',
+      })
+    ).rejects.toThrow('customerEmail must be a valid email')
+  })
+
+  it('throws when items is invalid JSON', async () => {
+    await expect(
+      getTool('propose_create_quotation').handler({
+        customerEmail: 'a@b.com',
+        items: 'not json at all',
+      })
+    ).rejects.toThrow('items must be a JSON array')
+  })
+
+  it('throws when items JSON is not an array', async () => {
+    await expect(
+      getTool('propose_create_quotation').handler({
+        customerEmail: 'a@b.com',
+        items: '{"productId":"p1"}',
+      })
+    ).rejects.toThrow('items must be a JSON array')
+  })
+
+  it('throws when items array is empty', async () => {
+    await expect(
+      getTool('propose_create_quotation').handler({
+        customerEmail: 'a@b.com',
+        items: '[]',
+      })
+    ).rejects.toThrow('items: provide 1-50 lines')
+  })
+
+  it('throws when items array exceeds 50', async () => {
+    const items = JSON.stringify(Array(51).fill({ productId: PRODUCT_ID, quantity: 1 }))
+    await expect(
+      getTool('propose_create_quotation').handler({
+        customerEmail: 'a@b.com',
+        items,
+      })
+    ).rejects.toThrow('items: provide 1-50 lines')
+  })
+
+  const grain = (over: Record<string, unknown> = {}) => ({
+    idx: 1,
+    product_id: PRODUCT_ID,
+    variant_id: null,
+    sub_variant_id: null,
+    name: 'Bolt',
+    variant_name: null,
+    sub_variant_name: null,
+    sku: 'B',
+    price: 118,
+    mrp: 0,
+    discount_pct: 0,
+    gst_percentage: 18,
+    hsn_code: null,
+    is_active: true,
+    has_variants: false,
+    has_subs: false,
+    stock_status: 'In Stock',
+    ...over,
+  })
+  const box = { product_id: PRODUCT_ID, variant_id: null, sub_variant_id: null, unit: 'box', display_label: null, factor: '10', dimension: 'count', is_base: true, min_qty: '1', max_qty: null, qty_step: '1' }
+
+  function setup(grains: any[], units: any[] = [], customer: any = null) {
+    vi.mocked(siteControls.getFeatureFlags).mockResolvedValue({ gstEnabled: true } as any)
+    mockQueryMany.mockImplementation(async (sql: string) =>
+      sql.includes('unnest(') ? grains : sql.includes('FROM product_units') ? units : []
+    )
+    mockQueryOne.mockResolvedValueOnce(customer)
+  }
+  const propose = (items: unknown[], extra: Record<string, unknown> = {}) =>
+    getTool('propose_create_quotation').handler({ customerEmail: 'a@b.com', items: JSON.stringify(items), ...extra }) as Promise<any>
+
+  it('refuses an item without a productId', async () => {
+    const r = await propose([{ quantity: 1 }])
+    expect(r.ok).toBe(false)
+    expect(r.summary).toMatch(/productId/)
+  })
+
+  it('refuses a product that is not found or inactive', async () => {
+    setup([])
+    expect((await propose([{ productId: PRODUCT_ID, quantity: 1 }])).summary).toMatch(/not found or inactive/)
+  })
+
+  it.each([0, -1, 'lots'])('refuses quantity %s', async qty => {
+    setup([grain()])
+    expect((await propose([{ productId: PRODUCT_ID, quantity: qty }])).summary).toMatch(/greater than zero/)
+  })
+
+  it('needs a variant for products with variants', async () => {
+    setup([grain({ has_variants: true })])
+    expect((await propose([{ productId: PRODUCT_ID, quantity: 1 }])).summary).toMatch(/has variants/)
+  })
+
+  it('proposes with the customer details the editor fills', async () => {
+    setup([grain()], [], { user_id: null, first_name: 'John', last_name: 'Doe', phone: '+91 98765 43210', gst_number: '29abcde1234f1z5' })
+    const r = await propose([{ productId: PRODUCT_ID, quantity: 2 }])
+    expect(r.proposed).toBe(true)
+    expect(r.kind).toBe('create_quotation')
+    expect(r.payload.consignee_name).toBe('John Doe')
+    expect(r.payload.consignee_phone).toBe('9876543210')
+    expect(r.payload.consignee_gstin).toBe('29abcde1234f1z5')
+    expect(r.payload.items[0]).toMatchObject({ rate: 100, discount_pct: 0, unit: 'PCS', buy_unit: null })
+    expect(r.ui_blocks[0].type).toBe('document')
+  })
+
+  it('anchors on MRP with the catalog discount', async () => {
+    setup([grain({ mrp: 236, discount_pct: 50 })])
+    const r = await propose([{ productId: PRODUCT_ID, quantity: 1 }])
+    expect(r.payload.items[0]).toMatchObject({ rate: 200, discount_pct: 50 })
+    expect(r.payload.total).toBe(118)
+  })
+
+  it('stacks an extra discount on the catalog one', async () => {
+    setup([grain({ mrp: 236, discount_pct: 50 })])
+    const r = await propose([{ productId: PRODUCT_ID, quantity: 1, extraDiscountPct: 10 }])
+    expect(r.payload.items[0].discount_pct).toBe(55)
+  })
+
+  it('takes a custom price per piece incl. GST', async () => {
+    setup([grain({ mrp: 236, discount_pct: 50 })])
+    const r = await propose([{ productId: PRODUCT_ID, quantity: 1, unitPrice: 177 }])
+    expect(r.payload.items[0]).toMatchObject({ rate: 150, discount_pct: 0 })
+  })
+
+  it('needs the selling unit and counts quantity in it', async () => {
+    setup([grain()], [box])
+    expect((await propose([{ productId: PRODUCT_ID, quantity: 50 }])).summary).toMatch(/sells in box \(10 pcs\)/)
+    setup([grain()], [box])
+    const r = await propose([{ productId: PRODUCT_ID, quantity: 5, buyUnit: 'boxes' }])
+    expect(r.payload.items[0]).toMatchObject({ quantity: 5, buy_unit: 'box', unit: 'BOX', sell_unit_factor: 10 })
+    expect(r.ui_blocks[0].lines[0].baseQty).toBe('= 50 pcs')
+    expect(r.payload.total).toBe(5900)
+  })
+
+  it('uses the email prefix as name when the user is unknown', async () => {
+    setup([grain()])
+    const r = await getTool('propose_create_quotation').handler({
+      customerEmail: 'unknown@shop.com',
+      items: JSON.stringify([{ productId: PRODUCT_ID, quantity: 3 }]),
+    }) as any
+    expect(r.payload.consignee_name).toBe('unknown')
+  })
+
+  it('carries notes, or null', async () => {
+    setup([grain()])
+    expect((await propose([{ productId: PRODUCT_ID, quantity: 1 }], { notes: 'Urgent' })).payload.notes).toBe('Urgent')
+    setup([grain()])
+    expect((await propose([{ productId: PRODUCT_ID, quantity: 1 }])).payload.notes).toBeNull()
+  })
+
+  it('uses plural "lines" in the confirmation for several items', async () => {
+    const PRODUCT_ID2 = '550e8400-e29b-41d4-a716-446655440002'
+    setup([grain(), grain({ idx: 2, product_id: PRODUCT_ID2, name: 'Washer' })])
+    const r = await propose([
+      { productId: PRODUCT_ID, quantity: 1 },
+      { productId: PRODUCT_ID2, quantity: 5 },
+    ])
+    expect(r.payload.items).toHaveLength(2)
+    expect(r.confirmation).toMatch(/2 lines/i)
+  })
+})
+
+describe('autoQuotationItems', () => {
+  const unit = (u: string, factor: number, isDefault = false) =>
+    ({ unit: u, label: u, factor, dimension: 'count', minQty: 1, maxQty: null, qtyStep: 1, isDefault })
+  const line = (qty: number, requestedUnit: string | null, units: any[], variants?: any[]) => ({
+    status: 'matched',
+    qty,
+    requestedUnit,
+    candidates: [{ productId: 'p1', units, variants }],
+  })
+
+  it('converts pieces into whole default units and keeps named units', () => {
+    expect(autoQuotationItems([line(50, null, [unit('box', 10, true)])])).toEqual([
+      { productId: 'p1', variantId: undefined, quantity: 5, buyUnit: 'box' },
+    ])
+    expect(autoQuotationItems([line(2, 'Boxes', [unit('box', 10, true), unit('pack', 100)])])?.[0]).toMatchObject({ quantity: 2, buyUnit: 'box' })
+  })
+
+  it('leaves the line to the admin when pieces do not divide or a variant must be chosen', () => {
+    expect(autoQuotationItems([line(55, 'pcs', [unit('box', 10, true)])])).toBeNull()
+    expect(autoQuotationItems([line(1, null, [], [{ id: 'v1' }, { id: 'v2' }])])).toBeNull()
+  })
+})
+
+// ── propose_send_quotation_email ──────────────────────────────────────────────
+
+describe('propose_send_quotation_email', () => {
+  beforeEach(() => vi.resetAllMocks())
+
+  it('throws when neither quotationId nor quoteNumber provided', async () => {
+    await expect(getTool('propose_send_quotation_email').handler({})).rejects.toThrow(
+      'Provide quotationId or quoteNumber'
+    )
+  })
+
+  it('throws when quotation not found in DB', async () => {
+    mockQueryOne.mockResolvedValueOnce(null)
+    await expect(getTool('propose_send_quotation_email').handler({ quoteNumber: 'QT-999' })).rejects.toThrow(
+      'Quotation not found'
+    )
+  })
+
+  it('throws when no valid recipient — consignee_email is null and no toEmail override', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'q1',
+      quote_number: 'QT-001',
+      status: 'draft',
+      consignee_email: null,
+      consignee_name: null,
+      total_amount: '1000',
+      view_token: 'tok',
+      quote_date: '2024-01-01',
+    })
+    await expect(getTool('propose_send_quotation_email').handler({ quotationId: 'q1' })).rejects.toThrow(
+      'No valid recipient'
+    )
+  })
+
+  it('throws when toEmail override has no @ sign', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'q1',
+      quote_number: 'QT-001',
+      status: 'draft',
+      consignee_email: 'a@b.com',
+      consignee_name: 'Alice',
+      total_amount: '1000',
+      view_token: 'tok',
+      quote_date: '2024-01-01',
+    })
+    await expect(
+      getTool('propose_send_quotation_email').handler({
+        quotationId: 'q1',
+        toEmail: 'noemail',
+      })
+    ).rejects.toThrow('No valid recipient')
+  })
+
+  it('returns { proposed: false } when quotation status is cancelled', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'q1',
+      quote_number: 'QT-001',
+      status: 'cancelled',
+      consignee_email: 'a@b.com',
+      consignee_name: 'Alice',
+      total_amount: '1000',
+      view_token: 'tok',
+      quote_date: '2024-01-01',
+    })
+    const result = (await getTool('propose_send_quotation_email').handler({ quotationId: 'q1' })) as any
+    expect(result.proposed).toBe(false)
+    expect(result.info).toMatch(/cancelled/i)
+  })
+
+  it('returns proposal using consignee_email when no toEmail override', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'q1',
+      quote_number: 'QT-001',
+      status: 'draft',
+      consignee_email: 'consignee@example.com',
+      consignee_name: 'Bob',
+      total_amount: '2000',
+      view_token: 'tok2',
+      quote_date: '2024-02-01',
+    })
+    const result = (await getTool('propose_send_quotation_email').handler({ quotationId: 'q1' })) as any
+    expect(result.proposed).toBe(true)
+    expect(result.kind).toBe('send_quotation_email')
+    expect(result.payload.toEmail).toBe('consignee@example.com')
+  })
+
+  it('uses empty string for consigneeName when consignee_name is null', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'q1',
+      quote_number: 'QT-001',
+      status: 'draft',
+      consignee_email: 'buyer@example.com',
+      consignee_name: null,
+      total_amount: '500',
+      view_token: 'tok3',
+      quote_date: '2024-03-01',
+    })
+    const result = (await getTool('propose_send_quotation_email').handler({ quotationId: 'q1' })) as any
+    expect(result.proposed).toBe(true)
+    expect(result.payload.consigneeName).toBe('')
+  })
+
+  it('uses toEmail override when provided and valid', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'q1',
+      quote_number: 'QT-001',
+      status: 'final',
+      consignee_email: 'orig@example.com',
+      consignee_name: 'Alice',
+      total_amount: '5000',
+      view_token: 'tokx',
+      quote_date: '2024-03-01',
+    })
+    const result = (await getTool('propose_send_quotation_email').handler({
+      quotationId: 'q1',
+      toEmail: 'override@other.com',
+    })) as any
+    expect(result.payload.toEmail).toBe('override@other.com')
+  })
+
+  it('looks up by quoteNumber instead of quotationId', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'q5',
+      quote_number: 'QT-005',
+      status: 'draft',
+      consignee_email: 'x@y.com',
+      consignee_name: 'X',
+      total_amount: '100',
+      view_token: 'tok5',
+      quote_date: '2024-04-01',
+    })
+    const result = (await getTool('propose_send_quotation_email').handler({ quoteNumber: 'QT-005' })) as any
+    expect(result.proposed).toBe(true)
+    expect(result.payload.quoteNumber).toBe('QT-005')
+  })
+})
+
+// ── match_quotation_items — embeddings query error fallback ───────────────────
+
+describe('match_quotation_items embeddings catch fallback', () => {
+  beforeEach(() => {
+    vi.resetAllMocks()
+    mockQueryMany.mockResolvedValue([])
+  })
+
+  it('treats line as unmatched when embeddings query rejects', async () => {
+    mockEmbed.mockResolvedValue([0.1, 0.2, 0.3])
+    // queryManyReplica (embeddings SELECT) rejects — .catch(() => []) should fire
+    mockRunWithHnswTuning.mockRejectedValueOnce(new Error('DB down'))
+    const lines = JSON.stringify([{ requestedText: 'M16 bolt', qty: 2 }])
+    const result = (await getTool('match_quotation_items').handler({ lines })) as any
+    expect(result.ok).toBe(true)
+    expect(result.data.lines[0].status).toBe('unmatched')
+    expect(result.data.counts.unmatched).toBe(1)
+  })
+})
+
+// ── extract_quotation_lines_from_attachment ───────────────────────────────────
+
+describe('extract_quotation_lines_from_attachment', () => {
+  beforeEach(() => vi.resetAllMocks())
+
+  it('returns err when attachment_id is empty', async () => {
+    const result = (await getTool('extract_quotation_lines_from_attachment').handler({ attachment_id: '' })) as any
+    expect(result.ok).toBe(false)
+    expect(result.summary).toMatch(/attachment_id is required/i)
+  })
+
+  it('returns err when attachment not found', async () => {
+    mockQueryOne.mockResolvedValueOnce(null)
+    const result = (await getTool('extract_quotation_lines_from_attachment').handler({ attachment_id: 'abc' })) as any
+    expect(result.ok).toBe(false)
+    expect(result.summary).toMatch(/not found or expired/i)
+  })
+
+  it('returns cached text when extracted_text already populated', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'a1',
+      mime_type: 'application/pdf',
+      filename: 'order.pdf',
+      byte_size: 1024,
+      data: Buffer.from(''),
+      extracted_text: '#read:any\nLine 1\nLine 2',
+      expires_at: '2099-01-01',
+    })
+    const result = (await getTool('extract_quotation_lines_from_attachment').handler({ attachment_id: 'a1' })) as any
+    expect(result.ok).toBe(true)
+    expect(result.meta.cached).toBe(true)
+    expect(result.data.text).toBe('Line 1\nLine 2')
+  })
+
+  it('extracts text from PDF from the PDF text layer when text is available', async () => {
+    vi.mocked(pdf.pdfText).mockResolvedValueOnce({ text: 'Parsed PDF text from the text layer', pages: 1 })
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'a1',
+      mime_type: 'application/pdf',
+      filename: 'doc.pdf',
+      byte_size: 500,
+      data: Buffer.from('%PDF'),
+      extracted_text: null,
+      expires_at: '2099-01-01',
+    })
+    mockQuery.mockResolvedValue(undefined as any)
+    const result = (await getTool('extract_quotation_lines_from_attachment').handler({ attachment_id: 'a1' })) as any
+    expect(result.ok).toBe(true)
+    expect(result.data.text).toBe('Parsed PDF text from the text layer')
+    expect(result.meta.source).toBe('pdf_text')
+    expect(result.meta.cached).toBe(false)
+  })
+
+  it('falls back to vision OCR when the text layer yields empty text and OCR succeeds', async () => {
+    vi.mocked(pdf.pdfText).mockResolvedValueOnce({ text: '   ', pages: 3 })
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'a1',
+      mime_type: 'application/pdf',
+      filename: 'scan.pdf',
+      byte_size: 200,
+      data: Buffer.from('%PDF'),
+      extracted_text: null,
+      expires_at: '2099-01-01',
+    })
+    mockOcrPdfPages.mockResolvedValueOnce({ ok: true, text: 'OCR text from PDF', pages: 3, model: 'gpt-4o' })
+    mockQuery.mockResolvedValue(undefined as any)
+    const result = (await getTool('extract_quotation_lines_from_attachment').handler({ attachment_id: 'a1' })) as any
+    expect(result.ok).toBe(true)
+    expect(result.data.text).toBe('OCR text from PDF')
+    expect(result.meta.source).toBe('vision_ocr')
+    expect(result.meta.pages).toBe(3)
+  })
+
+  it('returns err when the text layer yields empty and vision OCR fails', async () => {
+    vi.mocked(pdf.pdfText).mockResolvedValueOnce({ text: '', pages: 1 })
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'a1',
+      mime_type: 'application/pdf',
+      filename: 'bad.pdf',
+      byte_size: 100,
+      data: Buffer.from('%PDF'),
+      extracted_text: null,
+      expires_at: '2099-01-01',
+    })
+    mockOcrPdfPages.mockResolvedValueOnce({ ok: false, reason: 'Vision not configured', hint: 'Set up vision key' })
+    const result = (await getTool('extract_quotation_lines_from_attachment').handler({ attachment_id: 'a1' })) as any
+    expect(result.ok).toBe(false)
+    expect(result.summary).toMatch(/Could not read the attachment/i)
+    expect(result.reason).toBe('Vision not configured')
+  })
+
+  it('returns err when the text layer throws and vision OCR also fails', async () => {
+    vi.mocked(pdf.pdfText).mockRejectedValueOnce(new Error('corrupt PDF'))
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'a1',
+      mime_type: 'application/pdf',
+      filename: 'corrupt.pdf',
+      byte_size: 50,
+      data: Buffer.from('bad'),
+      extracted_text: null,
+      expires_at: '2099-01-01',
+    })
+    mockOcrPdfPages.mockResolvedValueOnce({ ok: false, reason: 'OCR error', hint: undefined })
+    const result = (await getTool('extract_quotation_lines_from_attachment').handler({ attachment_id: 'a1' })) as any
+    expect(result.ok).toBe(false)
+    expect(result.summary).toMatch(/Could not read the attachment/i)
+  })
+
+  it('extracts text from image via vision OCR when OCR succeeds', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'a1',
+      mime_type: 'image/jpeg',
+      filename: 'photo.jpg',
+      byte_size: 2048,
+      data: Buffer.from('img'),
+      extracted_text: null,
+      expires_at: '2099-01-01',
+    })
+    mockOcrImage.mockResolvedValueOnce({ ok: true, text: 'Image OCR text', model: 'gpt-4o' })
+    mockQuery.mockResolvedValue(undefined as any)
+    const result = (await getTool('extract_quotation_lines_from_attachment').handler({ attachment_id: 'a1' })) as any
+    expect(result.ok).toBe(true)
+    expect(result.data.text).toBe('Image OCR text')
+    expect(result.meta.source).toBe('vision_ocr')
+  })
+
+  it('returns err when image OCR fails', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'a1',
+      mime_type: 'image/png',
+      filename: 'scan.png',
+      byte_size: 1000,
+      data: Buffer.from('img'),
+      extracted_text: null,
+      expires_at: '2099-01-01',
+    })
+    mockOcrImage.mockResolvedValueOnce({ ok: false, reason: 'No vision model', hint: 'Configure vision' })
+    const result = (await getTool('extract_quotation_lines_from_attachment').handler({ attachment_id: 'a1' })) as any
+    expect(result.ok).toBe(false)
+    expect(result.summary).toMatch(/Could not read the attachment/i)
+    expect(result.reason).toBe('No vision model')
+  })
+
+  it('returns err for unsupported mime type', async () => {
+    mockQueryOne.mockResolvedValueOnce({
+      id: 'a1',
+      mime_type: 'audio/mpeg',
+      filename: 'note.mp3',
+      byte_size: 300,
+      data: Buffer.from('id3'),
+      extracted_text: null,
+      expires_at: '2099-01-01',
+    })
+    const result = (await getTool('extract_quotation_lines_from_attachment').handler({ attachment_id: 'a1' })) as any
+    expect(result.ok).toBe(false)
+    expect(result.reason).toMatch(/cannot listen to audio/i)
+  })
+})

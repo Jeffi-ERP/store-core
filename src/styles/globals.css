@@ -1,0 +1,566 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  /* :root, .dark and .light-scope colour variables come from packages/design-tokens via tailwind.config.ts
+     (addBase), so the mobile app and the web share one palette. */
+
+  /* White label text on the solid amber and green brand fills fails WCAG AA
+     contrast; near-black text passes. Scoped to the brand-fill plus text-white
+     pairing so tinted backgrounds and ghost styles keep their own text color.
+     A Site Builder theme sets --on-<fill> (themeCssVars): white on a dark brand
+     colour, near-black on a light one. */
+  .bg-primary-500.text-white {
+    color: var(--on-primary-500, #111827) !important;
+  }
+  .bg-primary-600.text-white {
+    color: var(--on-primary-600, #111827) !important;
+  }
+  .bg-accent-500.text-white {
+    color: var(--on-accent-500, #111827) !important;
+  }
+  .bg-accent-600.text-white {
+    color: var(--on-accent-600, #111827) !important;
+  }
+
+  /* Remap brand utility classes to CSS vars so they shift with theme */
+  .bg-primary-500 {
+    background-color: var(--primary-500) !important;
+  }
+  .bg-primary-600 {
+    background-color: var(--primary-600) !important;
+  }
+  .hover\:bg-primary-600:hover {
+    background-color: var(--primary-600) !important;
+  }
+  .text-primary-500 {
+    color: var(--primary-500) !important;
+  }
+  .text-primary-600 {
+    color: var(--primary-600) !important;
+  }
+  .border-primary-500 {
+    border-color: var(--primary-500) !important;
+  }
+
+  .bg-accent-500 {
+    background-color: var(--accent-500) !important;
+  }
+  .bg-accent-600 {
+    background-color: var(--accent-600) !important;
+  }
+  .hover\:bg-accent-500:hover {
+    background-color: var(--accent-500) !important;
+  }
+  .hover\:bg-accent-600:hover {
+    background-color: var(--accent-600) !important;
+  }
+  .text-accent-500 {
+    color: var(--accent-500) !important;
+  }
+  .text-accent-600 {
+    color: var(--accent-600) !important;
+  }
+  .border-accent-500 {
+    border-color: var(--accent-500) !important;
+  }
+  .border-b-accent-500 {
+    border-bottom-color: var(--accent-500) !important;
+  }
+  .focus\:ring-accent-500:focus {
+    --tw-ring-color: var(--accent-500) !important;
+  }
+  .group:hover .group-hover\:text-accent-600 {
+    color: var(--accent-600) !important;
+  }
+
+  * {
+    @apply box-border;
+  }
+
+  html {
+    @apply bg-surface;
+    /* No rubber-band past the page ends, which showed a pale strip under the dark footer. */
+    overscroll-behavior-y: none;
+  }
+
+  body {
+    @apply antialiased font-sans bg-surface text-foreground;
+    min-height: 100dvh;
+    margin: 0;
+    padding: 0;
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+
+  #__next {
+    @apply bg-surface;
+    min-height: 100dvh;
+  }
+
+  body > div:first-of-type {
+    @apply bg-surface;
+    min-height: 100dvh;
+  }
+
+  /* Dark mode form input defaults */
+  .dark input,
+  .dark select,
+  .dark textarea {
+    color-scheme: dark;
+  }
+
+  /* Light mode: make shadow-sm more visible so cards stand out from page bg */
+  :root .shadow-sm,
+  :root .hover\:shadow-xl:hover {
+    --tw-shadow: 0 1px 4px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.06);
+    box-shadow: var(--tw-shadow);
+  }
+}
+
+/* ── Control size tiers ───────────────────────────────────────────────────
+   Every interactive control — input, select trigger, button — picks a tier, and
+   controls that sit next to each other must share one.
+
+   Heights are PINNED, not left to padding. With border-box, a pinned height is
+   the same whether or not the element has a border; padding alone is not, so a
+   bordered input and a borderless button with the same py- differ by 2px. That
+   2px (and the 6px cases) is what these tiers exist to remove.
+
+     .field-md / .control-md   32px   AdminSelect default + md
+     .field-sm / .control-sm   32px   AdminSelect sm (same height, tighter padding)
+     .field-xs / .control-xs   26px   AdminSelect xs
+
+   field-* on inputs and textareas, control-* on buttons and links styled as
+   buttons. They are the same size; the two names just read correctly in place.
+   md and sm share one height (the tab-line action button) so every input, select, search,
+   date picker, button and segmented chip bar lines up.
+
+   text-sm and text-xs carry fixed line-heights (20px / 16px) even though the
+   font-size is a clamp, so these hold at every breakpoint.
+
+   Height-only form: h-control / h-control-sm (both 32px) from tailwind.config.
+   Admin buttons and fields that keep their own padding/width/text use these to
+   pin height — h-control is the default, h-control-sm for dense toolbars,
+   table rows and pagination.
+   ──────────────────────────────────────────────────────────────────────── */
+@layer components {
+  .field-md,
+  .field-normal {
+    @apply h-control px-3 py-0 text-sm rounded-lg;
+  }
+  .field-sm,
+  .field-compact {
+    @apply h-control-sm px-2 py-0 text-sm rounded-lg;
+  }
+  .field-xs {
+    @apply h-[26px] px-1.5 py-1 text-xs rounded leading-none;
+  }
+
+  /* Buttons need the same box plus centring, since they have no text baseline
+     of their own to sit on. */
+  .control-md {
+    @apply h-control inline-flex items-center justify-center gap-2 px-4 text-sm rounded-lg;
+  }
+  .control-sm {
+    @apply h-control-sm inline-flex items-center justify-center gap-1.5 px-3 text-sm rounded-lg;
+  }
+  .control-xs {
+    @apply h-[26px] inline-flex items-center justify-center gap-1 px-2 text-xs rounded leading-none;
+  }
+
+  /* Grows a small control's hit area to at least 44px square without changing its look. The control needs a
+     position of its own (relative/absolute) and room around it, or the grown area covers its neighbours. A fixed
+     size, not insets: rounding then only moves the box, so it never drops below 44px (a dot mid-transition). */
+  .hit-44::before {
+    content: '';
+    position: absolute;
+    left: min(0px, calc(50% - 22px));
+    top: min(0px, calc(50% - 22px));
+    width: max(100%, 44px);
+    height: max(100%, 44px);
+  }
+
+  /* Icon-only: square, so a row of them lines up with the fields beside it. */
+  .control-md.control-icon {
+    @apply w-[32px] px-0;
+  }
+  .control-sm.control-icon {
+    @apply w-[32px] px-0;
+  }
+  .control-xs.control-icon {
+    @apply w-[26px] px-0;
+  }
+}
+
+/* Every text-like input in the admin is one control height, whatever classes it carries,
+   so ad-hoc search boxes line up with the selects and buttons beside them. Textareas,
+   checkboxes, radios, ranges and files are left alone. */
+.admin-shell input:not(.field-xs):where(:not([type]), [type='text'], [type='search'], [type='email'], [type='url'], [type='tel'], [type='number'], [type='password'], [type='date'], [type='datetime-local'], [type='time']) {
+  height: 32px;
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+/* A textarea is the one control that must NOT be pinned — it grows with rows. */
+textarea.field-md,
+textarea.field-normal,
+textarea.field-sm,
+textarea.field-compact,
+textarea.field-xs {
+  height: auto;
+  /* field-* sets py-0 to centre one-line inputs; a textarea needs the padding back or text hugs the top edge. */
+  padding-top: 0.5rem;
+  padding-bottom: 0.5rem;
+}
+
+/* Toast notification animation */
+@keyframes slide-in-right {
+  from {
+    transform: translateX(100%);
+    opacity: 0;
+  }
+  to {
+    transform: translateX(0);
+    opacity: 1;
+  }
+}
+
+.animate-slide-in-right {
+  animation: slide-in-right 0.3s ease-out;
+}
+
+/* Confirmation dialog animation */
+@keyframes fade-in {
+  from {
+    opacity: 0;
+    transform: scale(0.95);
+  }
+  to {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes slide-up {
+  from {
+    transform: translateY(100%);
+  }
+  to {
+    transform: translateY(0);
+  }
+}
+
+.animate-slide-up {
+  animation: slide-up 0.3s ease-out;
+}
+
+.animate-fade-in {
+  animation: fade-in 0.2s ease-out;
+}
+
+@keyframes stagger-fade-up {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.stagger-grid > * {
+  opacity: 0;
+  animation: stagger-fade-up 0.5s ease-out forwards;
+}
+.stagger-grid > *:nth-child(1) {
+  animation-delay: 0ms;
+}
+.stagger-grid > *:nth-child(2) {
+  animation-delay: 50ms;
+}
+.stagger-grid > *:nth-child(3) {
+  animation-delay: 100ms;
+}
+.stagger-grid > *:nth-child(4) {
+  animation-delay: 150ms;
+}
+.stagger-grid > *:nth-child(5) {
+  animation-delay: 200ms;
+}
+.stagger-grid > *:nth-child(6) {
+  animation-delay: 250ms;
+}
+.stagger-grid > *:nth-child(7) {
+  animation-delay: 300ms;
+}
+.stagger-grid > *:nth-child(8) {
+  animation-delay: 350ms;
+}
+.stagger-grid > *:nth-child(9) {
+  animation-delay: 400ms;
+}
+.stagger-grid > *:nth-child(10) {
+  animation-delay: 450ms;
+}
+.stagger-grid > *:nth-child(11) {
+  animation-delay: 500ms;
+}
+.stagger-grid > *:nth-child(12) {
+  animation-delay: 550ms;
+}
+.stagger-grid > *:nth-child(n + 13) {
+  animation-delay: 600ms;
+}
+
+@keyframes img-shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  100% {
+    transform: translateX(100%);
+  }
+}
+
+@keyframes razorpay-marquee {
+  0% {
+    transform: translateX(0);
+  }
+  100% {
+    transform: translateX(-50%);
+  }
+}
+
+.razorpay-scroll {
+  display: flex;
+  width: max-content;
+  animation: razorpay-marquee 28s linear infinite;
+}
+.razorpay-scroll:hover {
+  animation-play-state: paused;
+}
+
+@keyframes adminSelectFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+/* AdSense Auto ads, anchors and vignettes stay hidden on pages that carry no ads (components/visitor/AdSense.tsx). */
+html[data-no-ads] ins.adsbygoogle,
+html[data-no-ads] .google-auto-placed {
+  display: none !important;
+}
+
+/* The storefront footer pads for the home indicator itself, so the body's inset would double it. */
+/* An AI-designed account page carries the account menu inside its own frame (site/code/parts/utility.tsx). */
+.account-nav-top:has(+ * [data-account-framed]) {
+  display: none;
+}
+
+body:has([data-footer-strip]) {
+  padding-bottom: 0;
+}
+
+/* The storefront footer makes room for a fixed bottom bar only while one is on screen. */
+body:has([data-bottom-bar]) [data-footer-strip] {
+  padding-bottom: calc(5.5rem + env(safe-area-inset-bottom));
+}
+body:has([data-bottom-bar='cart'], [data-bottom-bar='checkout']):has([data-bottom-bar='compare']) [data-footer-strip] {
+  padding-bottom: calc(10rem + env(safe-area-inset-bottom));
+}
+
+/* Toasts clear the home indicator and sit above any fixed bottom bar. */
+[data-toast] {
+  margin-bottom: env(safe-area-inset-bottom, 0px);
+}
+body:has([data-bottom-bar]) [data-toast] {
+  margin-bottom: calc(4rem + env(safe-area-inset-bottom, 0px));
+}
+body:has([data-bottom-bar='cart'], [data-bottom-bar='checkout']):has([data-bottom-bar='compare']) [data-toast] {
+  margin-bottom: calc(8rem + env(safe-area-inset-bottom, 0px));
+}
+
+@media (max-width: 639px) {
+  /* Full-width storefront toasts on phones. */
+  body:has([data-storefront]) [data-toast] {
+    left: 1rem;
+  }
+
+  /* 16px text fields on storefront phones (portalled sheets too) so iOS Safari doesn't zoom on focus.
+     Larger text (OTP boxes) is left alone. */
+  body:has([data-storefront])
+    :is(
+      input:not([type='checkbox'], [type='radio'], [type='range'], [type='file'], [type='color'], [type='button'], [type='submit'], [type='reset'], [type='image']),
+      select,
+      textarea
+    ):not(.text-lg, .text-xl, .text-2xl, .text-3xl, .text-4xl) {
+    font-size: 16px;
+  }
+}
+
+/* KpiGrid: the container width sets how many cards fit (150px + 12px gap each); n cards then take the
+   fewest rows, spread evenly (--kpi-cK: columns when K fit), and a short last row stretches. Counted on
+   the rendered cards, so fragments and wrapper components don't matter. */
+.kpi-grid {
+  container-type: inline-size;
+  width: 100%;
+}
+.kpi-grid > div {
+  --kpi-c2: 2; --kpi-c3: 3; --kpi-c4: 4; --kpi-c5: 5; --kpi-c6: 6;
+  --cols: var(--kpi-c2);
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.75rem;
+}
+.kpi-grid > div > * {
+  flex: 1 1 calc((100% - (var(--cols) - 1) * 0.75rem) / var(--cols) - 0.5px);
+  min-width: 0;
+}
+.kpi-grid > div:has(> :nth-child(1):last-child) { --kpi-c2: 1; --kpi-c3: 1; --kpi-c4: 1; --kpi-c5: 1; --kpi-c6: 1; }
+.kpi-grid > div:has(> :nth-child(2):last-child) { --kpi-c2: 2; --kpi-c3: 2; --kpi-c4: 2; --kpi-c5: 2; --kpi-c6: 2; }
+.kpi-grid > div:has(> :nth-child(3):last-child) { --kpi-c2: 2; --kpi-c3: 3; --kpi-c4: 3; --kpi-c5: 3; --kpi-c6: 3; }
+.kpi-grid > div:has(> :nth-child(4):last-child) { --kpi-c2: 2; --kpi-c3: 2; --kpi-c4: 4; --kpi-c5: 4; --kpi-c6: 4; }
+.kpi-grid > div:has(> :nth-child(5):last-child) { --kpi-c2: 2; --kpi-c3: 3; --kpi-c4: 3; --kpi-c5: 5; --kpi-c6: 5; }
+.kpi-grid > div:has(> :nth-child(6):last-child) { --kpi-c2: 2; --kpi-c3: 3; --kpi-c4: 3; --kpi-c5: 3; --kpi-c6: 6; }
+.kpi-grid > div:has(> :nth-child(7):last-child) { --kpi-c2: 2; --kpi-c3: 3; --kpi-c4: 4; --kpi-c5: 4; --kpi-c6: 4; }
+.kpi-grid > div:has(> :nth-child(8):last-child) { --kpi-c2: 2; --kpi-c3: 3; --kpi-c4: 4; --kpi-c5: 4; --kpi-c6: 4; }
+.kpi-grid > div:has(> :nth-child(9):last-child) { --kpi-c2: 2; --kpi-c3: 3; --kpi-c4: 3; --kpi-c5: 5; --kpi-c6: 5; }
+.kpi-grid > div:has(> :nth-child(10):last-child) { --kpi-c2: 2; --kpi-c3: 3; --kpi-c4: 4; --kpi-c5: 5; --kpi-c6: 5; }
+.kpi-grid > div:has(> :nth-child(11):last-child) { --kpi-c2: 2; --kpi-c3: 3; --kpi-c4: 4; --kpi-c5: 4; --kpi-c6: 6; }
+.kpi-grid > div:has(> :nth-child(12):last-child) { --kpi-c2: 2; --kpi-c3: 3; --kpi-c4: 4; --kpi-c5: 4; --kpi-c6: 6; }
+.kpi-grid > div:has(> :nth-child(13):last-child) { --kpi-c2: 2; --kpi-c3: 3; --kpi-c4: 4; --kpi-c5: 5; --kpi-c6: 5; }
+.kpi-grid > div:has(> :nth-child(14):last-child) { --kpi-c2: 2; --kpi-c3: 3; --kpi-c4: 4; --kpi-c5: 5; --kpi-c6: 5; }
+.kpi-grid > div:has(> :nth-child(15):last-child) { --kpi-c2: 2; --kpi-c3: 3; --kpi-c4: 4; --kpi-c5: 5; --kpi-c6: 5; }
+.kpi-grid > div:has(> :nth-child(16):last-child) { --kpi-c2: 2; --kpi-c3: 3; --kpi-c4: 4; --kpi-c5: 4; --kpi-c6: 6; }
+@container (min-width: 474px) { .kpi-grid > div { --cols: var(--kpi-c3); } }
+@container (min-width: 636px) { .kpi-grid > div { --cols: var(--kpi-c4); } }
+@container (min-width: 798px) { .kpi-grid > div { --cols: var(--kpi-c5); } }
+@container (min-width: 960px) { .kpi-grid > div { --cols: var(--kpi-c6); } }
+/* Every card in a grid is as tall as the tallest kind (one with a delta/sub line). */
+/* The :has() stays on the subject and hands the height down: as `div:has(.kpi-extra) > *` it made every
+   DOM insert or removal anywhere on the page restyle the whole document, so long lists stalled a little
+   more with each page appended. */
+.kpi-grid > div:has(.kpi-extra) { --kpi-card-min-h: 5.25rem; }
+:where(.kpi-grid > div > *) { min-height: var(--kpi-card-min-h, auto); }
+.kpi-fill { display: flex; flex-direction: column; }
+.kpi-fill > div { flex: 1 1 auto; align-content: stretch; }
+
+/* A homepage box in the admin's chosen shape. Size containment lets the ratio alone set its height (the
+   copy can't stretch it); on a short shape the copy sheds extras: -short below 15rem, -shorter below
+   10rem, -tiny below 5.5rem. */
+.shape-box {
+  container-type: size;
+}
+@container (max-height: 15rem) {
+  .shape-box .shape-short-hide { display: none; }
+  .shape-box .shape-short-tight { padding-top: 1rem; padding-bottom: 1rem; gap: 0.5rem; }
+  .shape-box .shape-short-title { font-size: clamp(1rem, 16cqh, 1.75rem); }
+  .shape-box .shape-short-tight.shape-above-dots { padding-bottom: 2.25rem; }
+  .shape-box .shape-short-cta { padding: 0.5rem 1rem; font-size: 0.75rem; }
+}
+@container (max-height: 10rem) {
+  .shape-box .shape-shorter-hide { display: none; }
+}
+@container (max-height: 5.5rem) {
+  .shape-box .shape-tiny-hide { display: none; }
+}
+
+/* Admin loading placeholders: a muted block with a soft light sweep (kit/skeleton.tsx). */
+.sk {
+  position: relative;
+  overflow: hidden;
+}
+.sk::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  transform: translateX(-100%);
+  background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.55), transparent);
+  animation: img-shimmer 1.4s ease-in-out infinite;
+}
+.dark .sk::after {
+  background: linear-gradient(90deg, transparent, rgb(255 255 255 / 0.06), transparent);
+}
+@media (prefers-reduced-motion: reduce) {
+  .sk::after {
+    animation: none;
+  }
+}
+
+/* Theme style hooks for the pages that take the theme instead of an AI design (account, orders, sign-in/up, legal,
+   business portal). Each hook reads a --ui-* variable that a Site Builder theme sets only when it has that style token
+   (styleCssVars in packages/site-blocks theme.ts); unset, it falls back to the utility it is keyed on, so the page
+   looks as built. Plain CSS after the utilities with :where(), so hover/focus/dark variants still win.
+   Tag only elements whose matching utilities have no sm:/md:/lg: variants. */
+.ui-card:where(.rounded-md) { border-radius: var(--ui-card-radius, 0.375rem); }
+.ui-card:where(.rounded-lg) { border-radius: var(--ui-card-radius, 0.5rem); }
+.ui-card:where(.rounded-xl) { border-radius: var(--ui-card-radius, 0.75rem); }
+.ui-card:where(.rounded-2xl) { border-radius: var(--ui-card-radius, 1rem); }
+.ui-card { border-width: var(--ui-card-border-width, 0px); }
+.ui-card:where(.border) { border-width: var(--ui-card-border-width, 1px); }
+.ui-card:where(.bg-surface-elevated) { background-color: var(--ui-card-bg, var(--color-surface-elevated)); }
+:root .ui-card { box-shadow: var(--ui-card-shadow, var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)); }
+:root .ui-card:where(.shadow, .shadow-sm, .shadow-md, .shadow-lg, .shadow-xl) {
+  box-shadow: var(--ui-card-shadow, var(--ui-shadow, var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)));
+}
+.ui-raised:where(.rounded-lg) { border-radius: var(--ui-card-radius, 0.5rem); }
+.ui-raised:where(.rounded-xl) { border-radius: var(--ui-card-radius, 0.75rem); }
+.ui-raised:where(.rounded-2xl) { border-radius: var(--ui-card-radius, 1rem); }
+:root .ui-raised { box-shadow: var(--ui-shadow-raised, var(--tw-ring-offset-shadow, 0 0 #0000), var(--tw-ring-shadow, 0 0 #0000), var(--tw-shadow)); }
+.ui-btn:where(.rounded) { border-radius: var(--ui-btn-radius, 0.25rem); }
+.ui-btn:where(.rounded-md) { border-radius: var(--ui-btn-radius, 0.375rem); }
+.ui-btn:where(.rounded-lg) { border-radius: var(--ui-btn-radius, 0.5rem); }
+.ui-btn:where(.rounded-xl) { border-radius: var(--ui-btn-radius, 0.75rem); }
+.ui-btn:where(.rounded-full) { border-radius: var(--ui-btn-radius, 9999px); }
+.ui-badge:where(.rounded) { border-radius: var(--ui-badge-radius, 0.25rem); }
+.ui-badge:where(.rounded-md) { border-radius: var(--ui-badge-radius, 0.375rem); }
+.ui-badge:where(.rounded-full) { border-radius: var(--ui-badge-radius, 9999px); }
+.ui-input:where(.rounded-md) { border-radius: var(--ui-input-radius, 0.375rem); }
+.ui-input:where(.rounded-lg) { border-radius: var(--ui-input-radius, 0.5rem); }
+.ui-input:where(.rounded-xl) { border-radius: var(--ui-input-radius, 0.75rem); }
+.ui-input:where(.border) { border-width: var(--ui-input-border-width, 1px); }
+.ui-input:where(.border-border-secondary) { border-color: var(--ui-input-border, var(--color-border-secondary)); }
+.ui-input:where(.border-border-default) { border-color: var(--ui-input-border, var(--color-border)); }
+.ui-input:where(.bg-surface) { background-color: var(--ui-input-bg, var(--color-surface)); }
+.ui-input:where(.bg-surface-elevated) { background-color: var(--ui-input-bg, var(--color-surface-elevated)); }
+/* No fallback: an unset variable leaves these inherited properties inheriting, which is what an untouched heading does. */
+.ui-heading { font-family: var(--ui-heading-font); text-transform: var(--ui-heading-case); letter-spacing: var(--ui-heading-tracking); font-weight: var(--ui-heading-weight); }
+.ui-heading:where(.font-medium) { font-weight: var(--ui-heading-weight, 500); }
+.ui-heading:where(.font-semibold) { font-weight: var(--ui-heading-weight, 600); }
+.ui-heading:where(.font-bold) { font-weight: var(--ui-heading-weight, 700); }
+.ui-heading:where(.font-extrabold) { font-weight: var(--ui-heading-weight, 800); }
+.ui-heading:where(.font-black) { font-weight: var(--ui-heading-weight, 900); }
+.ui-input:where(.rounded-r-lg) { border-top-right-radius: var(--ui-input-radius, 0.5rem); border-bottom-right-radius: var(--ui-input-radius, 0.5rem); }
+.ui-addon:where(.rounded-l-lg) { border-top-left-radius: var(--ui-input-radius, 0.5rem); border-bottom-left-radius: var(--ui-input-radius, 0.5rem); }
+.ui-addon:where(.border.border-r-0) { border-width: var(--ui-addon-border-width, 1px 0 1px 1px); }
+.ui-addon:where(.border-border-secondary) { border-color: var(--ui-input-border, var(--color-border-secondary)); }
+/* The store's product card (ProductCard), whose corners change at sm: 20px on phones and 0.5rem from sm up (the card,
+   and its stretched link's focus ring), each breakpoint restated so an unset token keeps it; its picture frame; and a
+   phone border that stays transparent unless the theme's cards are outlined. */
+.ui-card:where(.rounded-\[20px\]) { border-radius: var(--ui-card-radius, 20px); }
+.ui-card-link:where(.after\:rounded-\[20px\])::after { border-radius: var(--ui-card-radius, 20px); }
+.ui-media:where(.rounded-lg) { border-radius: var(--ui-card-radius, 0.5rem); }
+@media (min-width: 640px) {
+  .ui-card:where(.sm\:rounded-lg) { border-radius: var(--ui-card-radius, 0.5rem); }
+  .ui-card-link:where(.sm\:after\:rounded-lg)::after { border-radius: var(--ui-card-radius, 0.5rem); }
+}
+@media (max-width: 639.98px) {
+  .ui-card:where(.border-transparent) { border-color: var(--ui-card-border, transparent); }
+}
+
+/* Admin split layouts (desktop): each pane of a side-by-side layout scrolls on its own inside the screen.
+   .admin-split  — the row of panes; fills the screen below the page header (override --admin-split-offset).
+   .admin-pane   — a pane inside it; scrolls on its own.
+   .admin-sticky-pane — a side pane next to a long page: stays in view and scrolls on its own. */
+@media (min-width: 1024px) {
+  .admin-split { height: calc(100dvh - var(--admin-split-offset, 9rem)); min-height: 28rem; }
+  .admin-split > .admin-pane, .admin-pane { min-height: 0; overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+  .admin-sticky-pane { position: sticky; top: var(--admin-sticky-top, 1rem); max-height: calc(100dvh - var(--admin-sticky-offset, 6rem)); overflow-y: auto; overscroll-behavior: contain; scrollbar-width: thin; }
+}

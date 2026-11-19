@@ -1,0 +1,173 @@
+import { queryMany } from '@/lib/shared/db'
+import {
+  forSurface,
+  rowAudience,
+  rowPage,
+  productRowKey,
+  productSource,
+  sectionLimit,
+  visibleSections,
+  withDefaults,
+  type HomepageAudience,
+  type HomepagePage,
+  type HomepageSection,
+  type HomepageSurface,
+  type ProductSource,
+} from '@/lib/catalog/homepage-sections'
+
+/**
+ * `surface`, `page` and `audience` are read through to_jsonb rather than named: a tenant whose schema
+ * fan-out has not added the columns yet then keeps its layout (NULL reads as web / home / store)
+ * instead of failing over to the built-in one. Same reason they are filtered in JS.
+ */
+export const SURFACE_COLUMN_SQL = (alias: string) => `to_jsonb(${alias}) ->> 'surface' AS surface`
+export const PAGE_COLUMN_SQL = (alias: string) => `to_jsonb(${alias}) ->> 'page' AS page`
+export const AUDIENCE_COLUMN_SQL = (alias: string) => `to_jsonb(${alias}) ->> 'audience' AS audience`
+
+export async function getConfiguredSections(
+  surface: HomepageSurface = 'web',
+  page: HomepagePage = 'home'
+): Promise<HomepageSection[]> {
+  return (await getAudienceSections(surface, page, 'store')).sections
+}
+
+/**
+ * One page's visible sections for an audience, and the audience actually served: the business
+ * homepage falls back to the store's while it has nothing visible on this surface (or the website).
+ */
+export async function getAudienceSections(
+  surface: HomepageSurface,
+  page: HomepagePage,
+  audience: HomepageAudience,
+  /** Preview: the rows of a homepage draft instead of the live table. */
+  rows?: HomepageSection[]
+): Promise<{ audience: HomepageAudience; sections: HomepageSection[] }> {
+  const home = page === 'home'
+  try {
+    rows ??= await queryMany<HomepageSection>(
+      `SELECT id, type, title, subtitle, eyebrow, cta_label, cta_url, config,
+              display_order, is_active, starts_at, ends_at,
+              ${SURFACE_COLUMN_SQL('s')}, ${PAGE_COLUMN_SQL('s')}, ${AUDIENCE_COLUMN_SQL('s')}
+       FROM homepage_sections s
+       ORDER BY display_order ASC, created_at ASC`
+    )
+    // Page first, so a listing's rows never count as a layout of the homepage's (or vice versa).
+    const onPage = rows.filter(r => rowPage(r) === page)
+    // Window filtering happens in JS, never SQL: a SQL NOW() would be baked into the
+    // page's ISR cache entry and never re-evaluate.
+    if (audience === 'business' && home) {
+      const business = visibleSections(forSurface(onPage.filter(r => rowAudience(r) === 'business'), surface))
+      if (business.length > 0) return { audience: 'business', sections: business }
+    }
+    // A surface with no sections of its own shows the built-in homepage, never another surface's layout.
+    const own = forSurface(onPage.filter(r => rowAudience(r) === 'store'), surface)
+    return { audience: 'store', sections: visibleSections(home ? withDefaults(own) : own) }
+  } catch {
+    // Table missing or unreachable — fall back to the built-in layout rather than an empty page.
+    return { audience: 'store', sections: visibleSections(home ? withDefaults([]) : []) }
+  }
+}
+
+interface SourceClause {
+  where: string
+  orderBy: string
+}
+
+// The three previously separate queries (featured / new arrivals / best sellers) shared an
+// identical SELECT list and differed only here.
+function sourceClause(source: ProductSource, categorySlug: string | null): SourceClause {
+  switch (source) {
+    case 'new_arrivals':
+      return { where: 'p.is_active = true', orderBy: 'p.created_at DESC' }
+    case 'best_sellers':
+      return { where: 'p.is_active = true', orderBy: 'total_sold DESC, p.created_at DESC' }
+    case 'on_sale':
+      return { where: 'p.is_active = true AND p.mrp > p.base_price', orderBy: '(p.mrp - p.base_price) DESC' }
+    case 'category':
+      return {
+        where: categorySlug ? 'p.is_active = true AND c.slug = $2' : 'p.is_active = true',
+        orderBy: 'p.created_at DESC',
+      }
+    case 'featured':
+    default:
+      return { where: 'p.is_active = true AND p.is_featured = true', orderBy: 'p.created_at DESC' }
+  }
+}
+
+export interface ProductRowQueryDeps {
+  minPriceSql: string
+  variantStockTotalSql: string
+  variantMinMrpSql: string
+  /** Must COALESCE to 0 — best_sellers orders on this without NULLS LAST. */
+  totalSoldSql: string
+}
+
+export function buildProductRowSql(
+  source: ProductSource,
+  categorySlug: string | null,
+  deps: ProductRowQueryDeps
+): string {
+  const { where, orderBy } = sourceClause(source, categorySlug)
+  return buildProductCardSql({ where, orderBy, limit: '$1' }, deps)
+}
+
+/** The card-ready SELECT every product row uses, for any WHERE / ORDER BY / LIMIT placeholder. */
+export function buildProductCardSql(
+  { where, orderBy, limit }: { where: string; orderBy: string; limit: string },
+  deps: ProductRowQueryDeps
+): string {
+  return `
+    SELECT p.*,
+      json_build_object('id', c.id, 'name', c.name, 'slug', c.slug) AS categories,
+      json_build_object('id', b.id, 'name', b.name) AS brands,
+      COALESCE(
+        (SELECT json_agg(pi ORDER BY pi.display_order)
+         FROM product_images pi WHERE pi.product_id = p.id),
+        '[]'::json
+      ) AS product_images,
+      ${deps.variantStockTotalSql} AS variant_stock_total,
+      ${deps.minPriceSql} AS variant_min_price,
+      ${deps.variantMinMrpSql} AS variant_min_mrp,
+      ${deps.totalSoldSql} AS total_sold
+    FROM products p
+    LEFT JOIN categories c ON p.category_id = c.id
+    LEFT JOIN brands b ON p.brand_id = b.id
+    WHERE ${where}
+    ORDER BY ${orderBy}
+    LIMIT ${limit}
+  `
+}
+
+/**
+ * Which product rows a page needs, de-duplicated. Two rows configured identically
+ * (same source, limit and category) resolve to one query.
+ */
+export function planProductRows(
+  sections: HomepageSection[]
+): Map<string, { source: ProductSource; limit: number; categorySlug: string | null }> {
+  const plan = new Map<string, { source: ProductSource; limit: number; categorySlug: string | null }>()
+  for (const s of sections) {
+    if (s.type !== 'product_row') continue
+    const limit = sectionLimit(s, 8)
+    const key = productRowKey(s, limit)
+    if (plan.has(key)) continue
+    const categorySlug = typeof s.config?.categorySlug === 'string' ? s.config.categorySlug : null
+    plan.set(key, { source: productSource(s), limit, categorySlug })
+  }
+  return plan
+}
+
+/** The non-product data each enabled section type needs. Nothing else is fetched. */
+export function planDataNeeds(sections: HomepageSection[], surface: HomepageSurface = 'web', page: HomepagePage = 'home') {
+  const types = new Set(sections.map(s => s.type))
+  return {
+    heroSlides: types.has('hero'),
+    offerSlider: types.has('offer_slider'),
+    // The app's category screens read mainCategories from the home payload too.
+    mainCategories: (surface === 'app' && page === 'home') || types.has('category_grid'),
+    topBrands: types.has('brand_carousel'),
+    categoryShowcase: types.has('category_showcase'),
+    dealOfTheDay: types.has('deal_of_the_day'),
+    freeShippingThreshold: types.has('trust_strip'),
+  }
+}

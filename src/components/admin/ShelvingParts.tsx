@@ -1,0 +1,1069 @@
+'use client'
+
+import React, { useState } from 'react'
+import { Check, X } from 'lucide-react'
+import AdminTypeahead from '@/components/admin/AdminTypeahead'
+import { LoadingLines } from '@/components/admin/kit/skeleton'
+import AdminSelect from '@/components/admin/AdminSelect'
+import CopySku from '@/components/ui/CopySku'
+import { ADMIN_INPUT_CLASS } from '@/lib/shared/format'
+import { useCanWrite } from '@/contexts/AdminScopesContext'
+import { fieldInputCls, useActionToast } from '@/components/admin/kit'
+
+export interface Warehouse {
+  id: string
+  name: string
+  code: string
+  address: string | null
+  is_active: boolean
+}
+
+export interface ShelfLocation {
+  id: string
+  warehouse_id: string
+  warehouse_name: string
+  warehouse_code: string
+  aisle_code: string
+  rack_code: string
+  shelf_code: string
+  bin_code: string | null
+  display_code: string
+  notes: string | null
+  is_active: boolean
+  is_open_shelf: boolean
+  stock_count: number
+}
+
+export interface ShelfStock {
+  id: string
+  location_id: string
+  product_id: string
+  variant_id: string | null
+  sub_variant_id: string | null
+  quantity: number
+  updated_at: string
+  product_name: string
+  variant_name: string | null
+  sku: string
+  unit_label?: string | null
+  unit_factor?: number | null
+  unit_dimension?: string | null
+  perishable?: boolean
+  serialized?: boolean
+  batches?: {
+    id: string
+    lot_number: string | null
+    manufacture_date: string | null
+    expiry_date: string | null
+    quantity_remaining: number
+    serials?: string[]
+  }[]
+}
+
+const labelCls = 'block text-xs font-medium text-foreground-secondary mb-1'
+const inputCls = ADMIN_INPUT_CLASS
+const btnPrimary =
+  'flex-1 control-md border border-transparent bg-accent-500 hover:bg-accent-600 text-white font-medium transition-colors disabled:opacity-50'
+const btnSecondary =
+  'control-md border border-border-default bg-surface hover:bg-surface-secondary text-foreground font-medium transition-colors'
+
+export function WarehouseForm({
+  onSave,
+  onCancel,
+  initial,
+}: {
+  onSave: (data: { name: string; code: string; address: string }) => Promise<void>
+  onCancel: () => void
+  initial?: Partial<Warehouse>
+}) {
+  const [name, setName] = useState(initial?.name || '')
+  const [code, setCode] = useState(initial?.code || '')
+  const [address, setAddress] = useState(initial?.address || '')
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState('')
+  const toast = useActionToast()
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault()
+    if (!name.trim() || !code.trim()) {
+      setErr('Name and code required')
+      return
+    }
+    setSaving(true)
+    setErr('')
+    try {
+      await onSave({ name: name.trim(), code: code.trim(), address: address.trim() })
+    } catch (e: any) {
+      toast.error(e.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <form onSubmit={submit} className="space-y-3">
+      {err && (
+        <div className="rounded-lg bg-red-500/5 border border-red-500/40 px-3 py-2 text-xs text-red-600 dark:text-red-400">
+          {err}
+        </div>
+      )}
+      <div>
+        <label className={labelCls}>Name</label>
+        <input value={name} onChange={e => setName(e.target.value)} className={inputCls} placeholder="Main Store" />
+      </div>
+      <div>
+        <label className={labelCls}>Code (short ID)</label>
+        <input
+          value={code}
+          onChange={e => setCode(e.target.value.toUpperCase())}
+          className={inputCls + ' font-mono'}
+          placeholder="WH1"
+          maxLength={10}
+        />
+      </div>
+      <div>
+        <label className={labelCls}>Address (optional)</label>
+        <textarea value={address} onChange={e => setAddress(e.target.value)} className={inputCls} rows={2} />
+      </div>
+      <div className="flex gap-2 pt-1">
+        <button type="submit" disabled={saving} className={btnPrimary}>
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+        <button type="button" onClick={onCancel} className={btnSecondary}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  )
+}
+
+export function LocationForm({
+  warehouseId,
+  onSave,
+  onCancel,
+  initial,
+  lockedLevels = [],
+}: {
+  warehouseId: string
+  onSave: (data: {
+    aisle_code: string
+    rack_code: string
+    shelf_code: string
+    bin_code: string
+    notes: string
+  }) => Promise<void>
+  onCancel: () => void
+  initial?: Partial<ShelfLocation>
+  lockedLevels?: ('aisle' | 'rack' | 'shelf')[]
+}) {
+  const [aisle, setAisle] = useState(initial?.aisle_code || '')
+  const [rack, setRack] = useState(initial?.rack_code || '')
+  const [shelf, setShelf] = useState(initial?.shelf_code || '')
+  const [bin, setBin] = useState(initial?.bin_code || '')
+  const [notes, setNotes] = useState(initial?.notes || '')
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState('')
+  const toast = useActionToast()
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault()
+    if (!aisle.trim() || !rack.trim() || !shelf.trim()) {
+      setErr('Aisle, rack and shelf required')
+      return
+    }
+    setSaving(true)
+    setErr('')
+    try {
+      await onSave({
+        aisle_code: aisle.trim(),
+        rack_code: rack.trim(),
+        shelf_code: shelf.trim(),
+        bin_code: bin.trim(),
+        notes: notes.trim(),
+      })
+    } catch (e: any) {
+      toast.error(e.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const levels = [
+    {
+      key: 'aisle' as const,
+      label: 'Aisle',
+      placeholder: 'A',
+      value: aisle,
+      onChange: (v: string) => setAisle(v.toUpperCase()),
+      required: true,
+    },
+    {
+      key: 'rack' as const,
+      label: 'Rack',
+      placeholder: '01',
+      value: rack,
+      onChange: (v: string) => setRack(v),
+      required: true,
+    },
+    {
+      key: 'shelf' as const,
+      label: 'Shelf',
+      placeholder: 'C',
+      value: shelf,
+      onChange: (v: string) => setShelf(v.toUpperCase()),
+      required: true,
+    },
+    {
+      key: 'bin' as const,
+      label: 'Bin',
+      placeholder: '02',
+      value: bin,
+      onChange: (v: string) => setBin(v),
+      required: false,
+    },
+  ]
+
+  return (
+    <form onSubmit={submit} className="space-y-3">
+      {err && (
+        <div className="rounded-lg bg-red-500/5 border border-red-500/40 px-3 py-2 text-xs text-red-600 dark:text-red-400">
+          {err}
+        </div>
+      )}
+      {/* Level-by-level inputs in a breadcrumb row */}
+      <div className="flex items-end gap-1.5 flex-wrap">
+        {levels.map((lvl, i) => {
+          const locked = lockedLevels.includes(lvl.key as any)
+          return (
+            <React.Fragment key={lvl.label}>
+              {i > 0 && <span className="text-foreground-muted text-sm pb-1.5">–</span>}
+              <div className="flex flex-col gap-1">
+                <span className="text-[10px] font-semibold text-foreground-muted uppercase tracking-wide">
+                  {lvl.label}
+                  {!lvl.required && <span className="normal-case font-normal ml-0.5">(opt)</span>}
+                </span>
+                {locked ? (
+                  <div className="w-16 px-2 py-1.5 rounded-lg border border-border-default bg-surface-secondary text-foreground text-sm font-mono text-center select-none text-foreground-muted">
+                    {lvl.value || '–'}
+                  </div>
+                ) : (
+                  <input
+                    value={lvl.value}
+                    onChange={e => lvl.onChange(e.target.value)}
+                    className={`${fieldInputCls} w-16 px-2 font-mono text-center`}
+                    placeholder={lvl.placeholder}
+                    maxLength={10}
+                  />
+                )}
+              </div>
+            </React.Fragment>
+          )
+        })}
+      </div>
+      <div>
+        <label className={labelCls}>Notes (optional)</label>
+        <input
+          value={notes}
+          onChange={e => setNotes(e.target.value)}
+          className={inputCls}
+          placeholder="e.g. Fragile items only"
+        />
+      </div>
+      <div className="flex gap-2 pt-1">
+        <button type="submit" disabled={saving} className={btnPrimary}>
+          {saving ? 'Saving…' : 'Save'}
+        </button>
+        <button type="button" onClick={onCancel} className={btnSecondary}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  )
+}
+
+export function StockRow({
+  row,
+  locationId,
+  siblingLocations,
+  onRefresh,
+}: {
+  row: ShelfStock
+  locationId: string
+  siblingLocations: ShelfLocation[]
+  onRefresh: () => void
+}) {
+  const canWrite = useCanWrite('shelving')
+  const factor = Number(row.unit_factor) || 1
+  const isContinuous = ['length', 'weight', 'area', 'volume'].includes(row.unit_dimension ?? '')
+  const unitLabel = row.unit_label || 'unit'
+
+  function toSell(baseQty: number): string {
+    const v = baseQty / factor
+    return isContinuous ? v.toFixed(3) : String(Math.floor(v))
+  }
+  function toBase(sellQty: number): number {
+    const base = sellQty * factor
+    return isContinuous ? Math.round(base * 1000) / 1000 : Math.round(base)
+  }
+
+  const [editing, setEditing] = useState(false)
+  const [newQty, setNewQty] = useState(toSell(row.quantity))
+  const [moving, setMoving] = useState(false)
+  const [destId, setDestId] = useState('')
+  const [moveQty, setMoveQty] = useState(toSell(Math.min(factor, row.quantity)))
+  // batch move selections: batchId → qty in base units
+  const [batchMoveQtys, setBatchMoveQtys] = useState<Record<string, number>>({})
+  const [batchMoveRaw, setBatchMoveRaw] = useState<Record<string, string>>({})
+  const [saving, setSaving] = useState(false)
+  const [err, setErr] = useState('')
+  const toast = useActionToast()
+  const [batchesOpen, setBatchesOpen] = useState(false)
+
+  const batches = row.batches ?? []
+  const isPerishableWithBatches = row.perishable && batches.length > 0
+
+  function initBatchMove() {
+    // pre-select all batches with their full qty
+    const init: Record<string, number> = {}
+    for (const b of batches) init[b.id] = b.quantity_remaining
+    setBatchMoveQtys(init)
+    setBatchMoveRaw({})
+  }
+
+  const totalBatchMoveQty = Object.values(batchMoveQtys).reduce((s, q) => s + q, 0)
+
+  function expiryColor(expiry: string | null): string {
+    if (!expiry) return 'text-foreground-muted'
+    const days = Math.round((new Date(expiry).getTime() - Date.now()) / 86400000)
+    if (days < 0) return 'text-red-500 font-semibold'
+    if (days <= 7) return 'text-orange-500 font-semibold'
+    if (days <= 30) return 'text-yellow-600 font-semibold'
+    return 'text-green-600'
+  }
+
+  async function saveQty() {
+    const newBase = toBase(isContinuous ? parseFloat(newQty) : parseInt(newQty))
+    const diff = newBase - row.quantity
+    if (diff === 0) {
+      setEditing(false)
+      return
+    }
+    setSaving(true)
+    setErr('')
+    try {
+      const res = await fetch('/api/admin/shelving/stock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          location_id: locationId,
+          product_id: row.product_id,
+          variant_id: row.variant_id,
+          sub_variant_id: row.sub_variant_id,
+          quantity_change: diff,
+          reason: 'adjustment',
+        }),
+      })
+      if (!res.ok) throw new Error((await res.json()).error)
+      setEditing(false)
+      onRefresh()
+    } catch (e: any) {
+      toast.error(e.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  async function doMove() {
+    if (!destId) {
+      setErr('Select destination')
+      return
+    }
+    let qty: number
+    if (isPerishableWithBatches) {
+      qty = totalBatchMoveQty
+      if (qty <= 0) {
+        setErr('Select at least one batch to move')
+        return
+      }
+    } else {
+      const sellVal = isContinuous ? parseFloat(moveQty) : parseInt(moveQty)
+      if (!sellVal || sellVal <= 0) {
+        setErr('Enter valid quantity')
+        return
+      }
+      qty = toBase(sellVal)
+      if (qty <= 0) {
+        setErr('Enter valid quantity')
+        return
+      }
+    }
+    setSaving(true)
+    setErr('')
+    try {
+      const res = await fetch('/api/admin/shelving/stock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'move',
+          from_location_id: locationId,
+          to_location_id: destId,
+          product_id: row.product_id,
+          variant_id: row.variant_id,
+          sub_variant_id: row.sub_variant_id,
+          quantity: qty,
+        }),
+      })
+      if (!res.ok) throw new Error((await res.json()).error)
+      setMoving(false)
+      onRefresh()
+    } catch (e: any) {
+      toast.error(e.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const displayQty = toSell(row.quantity)
+  const maxSellQty = toSell(row.quantity)
+  const unitStep = isContinuous ? (factor < 1 ? factor : 0.001) : 1
+
+  return (
+    <div className="px-4 py-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-medium text-foreground truncate">{row.product_name}</p>
+          {row.variant_name && <p className="text-xs text-foreground-secondary truncate mt-0.5">{row.variant_name}</p>}
+          <p className="text-xs font-mono text-foreground-muted mt-0.5 [overflow-wrap:anywhere]">
+            <span className="inline-flex items-center gap-1">
+              {row.sku}
+              {row.sku && <CopySku sku={row.sku} />}
+            </span>
+          </p>
+        </div>
+        <div className="flex items-center gap-2 shrink-0">
+          {editing ? (
+            <div className="flex items-center gap-1.5">
+              <input
+                type="number"
+                value={newQty}
+                onChange={e => setNewQty(e.target.value)}
+                min={unitStep}
+                step={unitStep}
+                max={undefined}
+                className={`${fieldInputCls} w-20 px-2 text-center`}
+              />
+              <span className="text-xs text-foreground-muted">{unitLabel}</span>
+              <button
+                onClick={saveQty}
+                disabled={saving}
+                aria-label="Save"
+                className="w-8 h-8 flex items-center justify-center rounded-lg bg-green-500 hover:bg-green-600 text-white transition-colors disabled:opacity-50"
+              >
+                <Check className="w-3.5 h-3.5" />
+              </button>
+              <button
+                onClick={() => setEditing(false)}
+                aria-label="Cancel"
+                className="w-8 h-8 flex items-center justify-center rounded-lg border border-border-default hover:bg-surface-secondary text-foreground-secondary transition-colors"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ) : (row.perishable || row.serialized) && batches.length > 0 ? (
+            <button
+              onClick={() => setBatchesOpen(o => !o)}
+              className="flex items-center gap-1 text-sm font-bold tabular-nums text-foreground hover:text-accent-500 transition-colors min-w-[2rem] text-right"
+            >
+              {displayQty} <span className="text-xs font-normal text-foreground-muted">{unitLabel}</span>
+              <svg
+                className={`w-3 h-3 ml-0.5 transition-transform text-foreground-muted ${batchesOpen ? 'rotate-180' : ''}`}
+                fill="none"
+                stroke="currentColor"
+                viewBox="0 0 24 24"
+              >
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+              </svg>
+            </button>
+          ) : (
+            <button
+              onClick={() => {
+                setNewQty(displayQty)
+                setEditing(true)
+              }}
+              disabled={!canWrite}
+              className="text-sm font-bold tabular-nums text-foreground enabled:hover:text-accent-500 transition-colors min-w-[2rem] text-right disabled:cursor-default"
+            >
+              {displayQty} <span className="text-xs font-normal text-foreground-muted">{unitLabel}</span>
+            </button>
+          )}
+          {canWrite && (
+            <button
+              onClick={() => {
+                if (isPerishableWithBatches) initBatchMove()
+                setMoving(!moving)
+              }}
+              className="px-2.5 h-control-sm rounded-lg text-xs font-medium border border-border-default bg-surface hover:bg-surface-secondary text-foreground-secondary hover:text-foreground transition-colors"
+            >
+              Move
+            </button>
+          )}
+        </div>
+      </div>
+
+      {(row.perishable || row.serialized) && batchesOpen && batches.length > 0 && (
+        <div className="mt-2 rounded-lg border border-border-default overflow-x-auto">
+          <table className="w-full text-xs">
+            <thead className="bg-surface border-b border-border-default">
+              <tr>
+                <th className="px-3 py-1.5 text-left font-medium text-foreground-muted">Lot</th>
+                <th className="px-3 py-1.5 text-left font-medium text-foreground-muted">Mfg</th>
+                <th className="px-3 py-1.5 text-left font-medium text-foreground-muted">Expiry</th>
+                <th className="px-3 py-1.5 text-right font-medium text-foreground-muted">Qty</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border-default">
+              {batches.map((b, idx) => {
+                const serials: string[] = Array.isArray(b.serials) ? b.serials : []
+                return (
+                  <React.Fragment key={b.id}>
+                    <tr className="hover:bg-surface-secondary/50 transition-colors">
+                      <td className="px-3 py-2 font-mono text-foreground">
+                        {b.lot_number || <span className="text-foreground-muted">—</span>}
+                        {idx === 0 && (
+                          <span className="ml-1.5 text-[10px] bg-accent-500/10 text-accent-500 px-1 py-0.5 rounded font-medium">
+                            FIFO
+                          </span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-foreground-muted">
+                        {b.manufacture_date ? (
+                          new Date(b.manufacture_date).toLocaleDateString('en-IN', {
+                            day: 'numeric',
+                            month: 'short',
+                            year: 'numeric',
+                          })
+                        ) : (
+                          <span>—</span>
+                        )}
+                      </td>
+                      <td className={`px-3 py-2 ${expiryColor(b.expiry_date)}`}>
+                        {b.expiry_date ? (
+                          new Date(b.expiry_date).toLocaleDateString('en-IN', {
+                            day: 'numeric',
+                            month: 'short',
+                            year: 'numeric',
+                          })
+                        ) : (
+                          <span className="text-foreground-muted">—</span>
+                        )}
+                      </td>
+                      <td className="px-3 py-2 text-right font-medium text-foreground tabular-nums">
+                        {toSell(b.quantity_remaining)}{' '}
+                        <span className="font-normal text-foreground-muted">{unitLabel}</span>
+                      </td>
+                    </tr>
+                    {row.serialized && serials.length > 0 && (
+                      <tr>
+                        <td colSpan={4} className="px-3 pb-2 pt-0">
+                          <div className="flex flex-wrap gap-1.5 mt-1">
+                            {serials.map(sn => (
+                              <span
+                                key={sn}
+                                className="inline-flex items-center px-2 py-0.5 rounded bg-accent-500/5 text-xs font-mono text-accent-500 border border-accent-500/30"
+                              >
+                                {sn}
+                              </span>
+                            ))}
+                          </div>
+                        </td>
+                      </tr>
+                    )}
+                  </React.Fragment>
+                )
+              })}
+            </tbody>
+          </table>
+        </div>
+      )}
+
+      {err && (
+        <div className="mt-2 rounded-lg bg-red-500/5 border border-red-500/40 px-3 py-1.5 text-xs text-red-600 dark:text-red-400">
+          {err}
+        </div>
+      )}
+      {moving && (
+        <div className="mt-3 pt-3 border-t border-border-default space-y-3">
+          {/* Destination picker */}
+          <div>
+            <label className={labelCls}>To location</label>
+            <AdminSelect
+              options={[
+                { value: '', label: 'Select…' },
+                ...siblingLocations.filter(l => l.id !== locationId).map(l => ({ value: l.id, label: l.display_code })),
+              ]}
+              value={destId}
+              onChange={v => setDestId(v)}
+              placeholder="Select…"
+              sm
+            />
+          </div>
+
+          {isPerishableWithBatches ? (
+            /* Batch picker for perishable products */
+            <div className="rounded-lg border border-border-default overflow-x-auto">
+              <table className="w-full text-xs">
+                <thead className="bg-surface border-b border-border-default">
+                  <tr>
+                    <th className="px-3 py-1.5 w-7"></th>
+                    <th className="px-3 py-1.5 text-left font-medium text-foreground-muted">Lot</th>
+                    <th className="px-3 py-1.5 text-left font-medium text-foreground-muted">Expiry</th>
+                    <th className="px-3 py-1.5 text-left font-medium text-foreground-muted">Avail</th>
+                    <th className="px-3 py-1.5 text-left font-medium text-foreground-muted">Move qty</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-border-default">
+                  {batches.map((b, idx) => {
+                    const checked = (batchMoveQtys[b.id] ?? 0) > 0
+                    const bQty = batchMoveQtys[b.id] ?? 0
+                    return (
+                      <tr
+                        key={b.id}
+                        className={`transition-colors ${checked ? 'bg-accent-500/5' : 'hover:bg-surface-secondary/50 cursor-pointer'}`}
+                        onClick={() => {
+                          if (checked) {
+                            setBatchMoveQtys(s => {
+                              const n = { ...s }
+                              delete n[b.id]
+                              return n
+                            })
+                            setBatchMoveRaw(s => {
+                              const n = { ...s }
+                              delete n[b.id]
+                              return n
+                            })
+                          } else setBatchMoveQtys(s => ({ ...s, [b.id]: b.quantity_remaining }))
+                        }}
+                      >
+                        <td className="px-3 py-2" onClick={e => e.stopPropagation()}>
+                          <input
+                            type="checkbox"
+                            checked={checked}
+                            onChange={() => {
+                              if (checked) {
+                                setBatchMoveQtys(s => {
+                                  const n = { ...s }
+                                  delete n[b.id]
+                                  return n
+                                })
+                                setBatchMoveRaw(s => {
+                                  const n = { ...s }
+                                  delete n[b.id]
+                                  return n
+                                })
+                              } else setBatchMoveQtys(s => ({ ...s, [b.id]: b.quantity_remaining }))
+                            }}
+                            className="accent-accent-500"
+                          />
+                        </td>
+                        <td className="px-3 py-2 font-mono text-foreground">
+                          {b.lot_number || <span className="text-foreground-muted">—</span>}
+                          {idx === 0 && (
+                            <span className="ml-1.5 text-[10px] bg-accent-500/10 text-accent-500 px-1 py-0.5 rounded font-medium">
+                              FIFO
+                            </span>
+                          )}
+                        </td>
+                        <td className={`px-3 py-2 ${expiryColor(b.expiry_date)}`}>
+                          {b.expiry_date ? (
+                            new Date(b.expiry_date).toLocaleDateString('en-IN', {
+                              day: 'numeric',
+                              month: 'short',
+                              year: 'numeric',
+                            })
+                          ) : (
+                            <span className="text-foreground-muted">—</span>
+                          )}
+                        </td>
+                        <td className="px-3 py-2 text-foreground">{toSell(b.quantity_remaining)}</td>
+                        <td className="px-3 py-2" onClick={e => e.stopPropagation()}>
+                          {checked ? (
+                            <div className="flex items-center gap-1">
+                              <button
+                                type="button"
+                                onClick={() => setBatchMoveQtys(s => ({ ...s, [b.id]: Math.max(1, bQty - 1) }))}
+                                disabled={bQty <= 1}
+                                className="w-6 h-6 flex items-center justify-center rounded border border-border-default bg-surface text-foreground hover:bg-surface-elevated disabled:opacity-30 text-xs font-bold transition-colors"
+                              >
+                                ‹
+                              </button>
+                              <input
+                                type="text"
+                                inputMode="numeric"
+                                value={batchMoveRaw[b.id] ?? String(bQty)}
+                                onChange={e => {
+                                  const raw = e.target.value.replace(/[^0-9]/g, '')
+                                  setBatchMoveRaw(s => ({ ...s, [b.id]: raw }))
+                                  const v = parseInt(raw)
+                                  if (!isNaN(v) && v >= 1)
+                                    setBatchMoveQtys(s => ({ ...s, [b.id]: Math.min(v, b.quantity_remaining) }))
+                                }}
+                                onBlur={() => {
+                                  const clamped = Math.min(Math.max(1, batchMoveQtys[b.id] ?? 1), b.quantity_remaining)
+                                  setBatchMoveQtys(s => ({ ...s, [b.id]: clamped }))
+                                  setBatchMoveRaw(s => ({ ...s, [b.id]: String(clamped) }))
+                                }}
+                                className="field-xs w-12 text-center font-medium text-foreground tabular-nums border border-border-default bg-surface px-1 focus:outline-none focus:ring-1 focus:ring-accent-500"
+                              />
+                              <button
+                                type="button"
+                                onClick={() =>
+                                  setBatchMoveQtys(s => ({ ...s, [b.id]: Math.min(b.quantity_remaining, bQty + 1) }))
+                                }
+                                disabled={bQty >= b.quantity_remaining}
+                                className="w-6 h-6 flex items-center justify-center rounded border border-border-default bg-surface text-foreground hover:bg-surface-elevated disabled:opacity-30 text-xs font-bold transition-colors"
+                              >
+                                ›
+                              </button>
+                            </div>
+                          ) : (
+                            <span className="text-foreground-muted">—</span>
+                          )}
+                        </td>
+                      </tr>
+                    )
+                  })}
+                </tbody>
+              </table>
+              {totalBatchMoveQty > 0 && (
+                <div className="px-3 py-2 bg-surface border-t border-border-default text-xs text-foreground-muted text-right">
+                  Total to move:{' '}
+                  <span className="font-semibold text-foreground">
+                    {toSell(totalBatchMoveQty)} {unitLabel}
+                  </span>
+                </div>
+              )}
+            </div>
+          ) : (
+            /* Plain qty input for non-perishable */
+            <div className="w-24">
+              <label className={labelCls}>Qty ({unitLabel})</label>
+              <input
+                type="number"
+                value={moveQty}
+                onChange={e => setMoveQty(e.target.value)}
+                className={`${fieldInputCls} px-2 text-center`}
+                min={unitStep}
+                step={unitStep}
+                max={Number(maxSellQty)}
+              />
+            </div>
+          )}
+
+          <div className="flex gap-2">
+            <button
+              onClick={doMove}
+              disabled={saving || (isPerishableWithBatches ? totalBatchMoveQty === 0 : false)}
+              className="px-4 h-control-sm rounded-lg text-xs font-medium bg-accent-500 hover:bg-accent-600 text-white transition-colors disabled:opacity-50"
+            >
+              {saving ? '…' : 'Move'}
+            </button>
+            <button
+              onClick={() => setMoving(false)}
+              className="px-3 h-control-sm rounded-lg text-xs font-medium border border-border-default bg-surface hover:bg-surface-secondary text-foreground-secondary transition-colors"
+            >
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  )
+}
+
+export function AssignStockForm({
+  location,
+  onSave,
+  onCancel,
+}: {
+  location: ShelfLocation
+  onSave: () => void
+  onCancel: () => void
+}) {
+  const [query, setQuery] = useState('')
+  const [selected, setSelected] = useState<{
+    productId: string
+    variantId: string | null
+    subVariantId: string | null
+    label: string
+    inventoryQty: number // in base units
+    unallocatedQty: number | null // in base units
+    unitLabel: string
+    unitFactor: number
+    unitStep: number
+    isContinuous: boolean
+  } | null>(null)
+  const [qty, setQty] = useState('1')
+  const [saving, setSaving] = useState(false)
+  const [loadingAvail, setLoadingAvail] = useState(false)
+  const [err, setErr] = useState('')
+  const toast = useActionToast()
+
+  async function handleSelect(item: { id: string; label: string }) {
+    const parts = item.id.split('\x1f')
+    const rawId = parts[0]
+    let productId = '',
+      variantId: string | null = null,
+      subVariantId: string | null = null
+    if (rawId.startsWith('product:')) productId = rawId.slice(8)
+    else if (rawId.startsWith('variant:')) {
+      variantId = rawId.slice(8)
+      productId = ''
+    } else if (rawId.startsWith('subvariant:')) {
+      subVariantId = rawId.slice(11)
+      productId = ''
+      variantId = parts[14] || null
+    }
+    const inventoryQty = parseInt(parts[11] || '0') || 0 // base units
+    const resolvedProductId = parts[12] || productId
+
+    setSelected({
+      productId,
+      variantId,
+      subVariantId,
+      label: item.label,
+      inventoryQty,
+      unallocatedQty: null,
+      unitLabel: 'unit',
+      unitFactor: 1,
+      unitStep: 1,
+      isContinuous: false,
+    })
+    setQuery(item.label)
+    setErr('')
+    setQty('1')
+
+    setLoadingAvail(true)
+    try {
+      const [shelfRes, unitRes] = await Promise.all([
+        fetch(
+          `/api/admin/shelving/stock?${new URLSearchParams({
+            ...(productId ? { product_id: productId } : {}),
+            ...(variantId ? { variant_id: variantId } : {}),
+            ...(subVariantId ? { sub_variant_id: subVariantId } : {}),
+          })}`,
+          { credentials: 'include' }
+        ),
+        resolvedProductId
+          ? fetch(`/api/admin/products/${resolvedProductId}/units${variantId ? `?variant_id=${variantId}` : ''}`)
+          : null,
+      ])
+
+      let shelfTotal = 0 // base units
+      if (shelfRes.ok) {
+        const data = await shelfRes.json()
+        shelfTotal = (data.locations || []).reduce((s: number, l: { quantity: number }) => s + (l.quantity || 0), 0)
+      }
+
+      let unitLabel = 'unit',
+        unitFactor = 1,
+        unitStep = 1,
+        isContinuous = false
+      if (unitRes?.ok) {
+        const udata = await unitRes.json()
+        const units: {
+          unit: string
+          display_label: string | null
+          factor: number
+          dimension: string
+          is_base: boolean
+          id: string
+        }[] = udata.units || []
+        const sellUnitId = parts[13]
+        const sellUnit = sellUnitId ? units.find(u => u.id === sellUnitId) : units.find(u => u.is_base)
+        if (sellUnit) {
+          unitLabel = sellUnit.display_label || sellUnit.unit
+          unitFactor = Number(sellUnit.factor) || 1
+          isContinuous = ['length', 'weight', 'area', 'volume'].includes(sellUnit.dimension)
+          unitStep = isContinuous ? (unitFactor < 1 ? unitFactor : 0.001) : 1
+        }
+      }
+
+      const unallocatedBase = Math.max(0, inventoryQty - shelfTotal)
+      setSelected(s =>
+        s ? { ...s, unallocatedQty: unallocatedBase, unitLabel, unitFactor, unitStep, isContinuous } : s
+      )
+      // Default qty = 1 sell unit
+      setQty(isContinuous ? unitStep.toFixed(3) : '1')
+    } catch {
+      /* non-critical */
+    } finally {
+      setLoadingAvail(false)
+    }
+  }
+
+  async function submit(e: React.FormEvent) {
+    e.preventDefault()
+    if (!selected) {
+      setErr('Select a product first')
+      return
+    }
+    // qty entered in sell units — convert to base units for API
+    const qtyInSellUnits = selected.isContinuous ? parseFloat(qty) : parseInt(qty)
+    if (!qtyInSellUnits || qtyInSellUnits <= 0) {
+      setErr('Enter valid quantity')
+      return
+    }
+    const qtyInBaseUnits = Math.round(qtyInSellUnits * selected.unitFactor)
+    if (selected.unallocatedQty !== null && qtyInBaseUnits > selected.unallocatedQty) {
+      const maxSellUnits = toSellUnits(selected.unallocatedQty, selected.unitFactor, selected.isContinuous)
+      setErr(`Only ${maxSellUnits} ${selected.unitLabel}(s) unallocated`)
+      return
+    }
+    setSaving(true)
+    setErr('')
+    try {
+      const res = await fetch('/api/admin/shelving/stock', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          location_id: location.id,
+          product_id: selected.productId || '',
+          variant_id: selected.variantId,
+          sub_variant_id: selected.subVariantId,
+          quantity_change: qtyInBaseUnits,
+          reason: 'assign',
+        }),
+      })
+      if (!res.ok) throw new Error((await res.json()).error)
+      onSave()
+    } catch (e: any) {
+      toast.error(e.message)
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  function toSellUnits(baseQty: number, factor: number, continuous: boolean): number | string {
+    const v = baseQty / factor
+    return continuous ? v.toFixed(3) : Math.floor(v)
+  }
+
+  const unallocatedBase = selected?.unallocatedQty ?? null
+  const factor = selected?.unitFactor ?? 1
+  const isContinuous = selected?.isContinuous ?? false
+  const inventoryBase = selected?.inventoryQty ?? 0
+  const allocatedBase = unallocatedBase !== null ? inventoryBase - unallocatedBase : null
+
+  // Display values in sell units
+  const inventoryDisplay = toSellUnits(inventoryBase, factor, isContinuous)
+  const allocatedDisplay = allocatedBase !== null ? toSellUnits(allocatedBase, factor, isContinuous) : null
+  const unallocatedDisplay = unallocatedBase !== null ? toSellUnits(unallocatedBase, factor, isContinuous) : null
+  const maxQtyInSellUnits =
+    unallocatedBase !== null ? Number(toSellUnits(unallocatedBase, factor, isContinuous)) : undefined
+
+  const unitLabel = selected?.unitLabel ?? 'unit'
+  const fillPct = inventoryBase > 0 && allocatedBase !== null ? Math.round((allocatedBase / inventoryBase) * 100) : 0
+
+  return (
+    <form onSubmit={submit} className="space-y-3 p-4 bg-surface-secondary rounded-xl border border-border-default">
+      <p className="text-sm font-medium text-foreground">
+        Assign stock to{' '}
+        <span className="font-mono text-accent-500">{location.display_code}</span>
+      </p>
+      {err && (
+        <div className="rounded-lg bg-red-500/5 border border-red-500/40 px-3 py-2 text-xs text-red-600 dark:text-red-400">
+          {err}
+        </div>
+      )}
+      <div>
+        <label className={labelCls}>Product / SKU</label>
+        <AdminTypeahead
+          type="label_products"
+          value={query}
+          onChange={v => {
+            setQuery(v)
+            if (!v) setSelected(null)
+          }}
+          onSelect={handleSelect}
+          placeholder="Search product or SKU…"
+        />
+      </div>
+
+      {selected && (
+        <div className="rounded-lg border border-border-default bg-surface p-3 space-y-2">
+          {loadingAvail ? (
+            <LoadingLines lines={2} />
+          ) : unallocatedBase !== null ? (
+            <>
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-foreground-muted">Total inventory</span>
+                <span className="font-medium text-foreground">
+                  {inventoryDisplay} {unitLabel}
+                </span>
+              </div>
+              <div className="relative h-2 rounded-full bg-surface-secondary overflow-hidden">
+                <div
+                  className="absolute inset-y-0 left-0 rounded-full bg-accent-500 transition-all"
+                  style={{ width: `${fillPct}%` }}
+                />
+              </div>
+              <div className="flex items-center justify-between text-xs">
+                <span className="text-foreground-muted">
+                  On shelves:{' '}
+                  <span className="font-medium text-foreground">
+                    {allocatedDisplay} {unitLabel}
+                  </span>
+                </span>
+                {unallocatedBase > 0 ? (
+                  <span className="text-green-600 dark:text-green-400 font-medium">{unallocatedDisplay} available</span>
+                ) : (
+                  <span className="text-amber-600 dark:text-amber-400 font-medium">All allocated</span>
+                )}
+              </div>
+            </>
+          ) : null}
+        </div>
+      )}
+
+      {selected && (
+        <div>
+          <label className={labelCls}>Quantity to assign ({unitLabel})</label>
+          <div className="flex items-center gap-2">
+            <input
+              type="number"
+              value={qty}
+              onChange={e => setQty(e.target.value)}
+              className={inputCls}
+              min={selected.unitStep}
+              step={selected.unitStep}
+              max={maxQtyInSellUnits}
+              disabled={loadingAvail || unallocatedBase === 0}
+            />
+            {unallocatedBase !== null && unallocatedBase > 0 && (
+              <button
+                type="button"
+                onClick={() => setQty(String(unallocatedDisplay))}
+                className="shrink-0 px-3 h-control-sm rounded-lg text-xs font-medium border border-border-default bg-surface hover:bg-surface-secondary text-foreground-secondary hover:text-foreground transition-colors whitespace-nowrap"
+              >
+                All ({unallocatedDisplay})
+              </button>
+            )}
+          </div>
+        </div>
+      )}
+
+      <div className="flex gap-2">
+        <button
+          type="submit"
+          disabled={saving || !selected || loadingAvail || unallocatedBase === 0}
+          className={btnPrimary}
+        >
+          {saving ? 'Saving…' : 'Assign'}
+        </button>
+        <button type="button" onClick={onCancel} className={btnSecondary}>
+          Cancel
+        </button>
+      </div>
+    </form>
+  )
+}

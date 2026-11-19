@@ -1,0 +1,1273 @@
+import type { CardProps } from '@/lib/catalog/product-card-props'
+
+export type SectionType =
+  | 'hero'
+  | 'offer_slider'
+  | 'trust_strip'
+  | 'category_grid'
+  | 'brand_carousel'
+  | 'product_row'
+  | 'category_showcase'
+  | 'deal_of_the_day'
+  | 'promo_banner'
+  | 'featured_for_you'
+  | 'benefits'
+  | 'why_us'
+  | 'about'
+  | 'business_cta'
+  | 'countdown_deal'
+  | 'testimonials'
+  | 'recently_viewed'
+  | 'category_tabs'
+  | 'bundle_spotlight'
+  | 'back_in_stock'
+  | 'blog_teaser'
+  | 'social_strip'
+  | 'value_stats'
+  | 'motion_hero'
+  | 'stories'
+  | 'product_spotlight'
+  | 'rewards_game'
+  | 'slides'
+  | 'business_reorder'
+  | 'business_quotes'
+  | 'business_offers'
+  | 'business_account'
+
+export const SECTION_TYPES: SectionType[] = [
+  'hero',
+  'offer_slider',
+  'trust_strip',
+  'category_grid',
+  'brand_carousel',
+  'product_row',
+  'category_showcase',
+  'deal_of_the_day',
+  'promo_banner',
+  'featured_for_you',
+  'benefits',
+  'why_us',
+  'about',
+  'business_cta',
+  'countdown_deal',
+  'testimonials',
+  'recently_viewed',
+  'category_tabs',
+  'bundle_spotlight',
+  'back_in_stock',
+  'blog_teaser',
+  'social_strip',
+  'value_stats',
+  'motion_hero',
+  'stories',
+  'product_spotlight',
+  'rewards_game',
+  'slides',
+  'business_reorder',
+  'business_quotes',
+  'business_offers',
+  'business_account',
+]
+
+/** Sections that load the signed-in business's own data on the client (GET /api/business/home). */
+export const BUSINESS_SECTION_TYPES: ReadonlySet<SectionType> = new Set<SectionType>([
+  'business_reorder',
+  'business_quotes',
+  'business_offers',
+  'business_account',
+])
+
+/**
+ * Types an app build from before per-surface layouts never sees: a GET /api/home with no ?surface
+ * is such a build, and it renders nothing for a type it doesn't know, so these are left out of its
+ * payload rather than loaded for nothing.
+ */
+export const LEGACY_APP_HIDDEN_TYPES: ReadonlySet<SectionType> = new Set<SectionType>([
+  'motion_hero',
+  'stories',
+  'product_spotlight',
+  'rewards_game',
+  'slides',
+])
+
+/** Which query backs a product_row. Collapses the separate featured/new/best-seller fetches. */
+export type ProductSource = 'featured' | 'new_arrivals' | 'best_sellers' | 'on_sale' | 'category'
+
+export type SectionLayout = 'grid' | 'carousel'
+
+/**
+ * Where a page shows: the desktop website, phone browsers or the app. Each surface has a layout of its
+ * own (sections and hero slides): a row belongs to exactly one surface, so nothing set on one changes
+ * another. Copying a layout between surfaces is an explicit action (copySurfaceLayout).
+ */
+export type HomepageSurface = 'web' | 'web_mobile' | 'app'
+
+export const HOMEPAGE_SURFACES: HomepageSurface[] = ['web', 'web_mobile', 'app']
+
+/** Which homepage draft an editor write targets (also accepted as `?draft=`). */
+export const HOMEPAGE_DRAFT_HEADER = 'x-homepage-draft'
+
+/** The page a section is on: the homepage, or between products on a listing (every category shares one, as does every brand). */
+export type HomepagePage = 'home' | 'products' | 'category' | 'brand'
+
+export const HOMEPAGE_PAGES: HomepagePage[] = ['home', 'products', 'category', 'brand']
+
+/** Who the homepage is for: the store, or business accounts (/business and the app's business store). Business has a homepage only. */
+export type HomepageAudience = 'store' | 'business'
+
+export const HOMEPAGE_AUDIENCES: HomepageAudience[] = ['store', 'business']
+
+export interface HomepageSection {
+  id: string
+  type: SectionType
+  title: string | null
+  subtitle: string | null
+  eyebrow: string | null
+  cta_label: string | null
+  cta_url: string | null
+  config: Record<string, unknown>
+  display_order: number
+  is_active: boolean
+  starts_at: string | null
+  ends_at: string | null
+  /** Absent on rows saved before the column existed; read it through rowSurface(). */
+  surface?: HomepageSurface | null
+  /** Absent on rows saved before the column existed; read it through rowPage(). */
+  page?: HomepagePage | null
+  /** Absent on rows saved before the column existed; read it through rowAudience(). */
+  audience?: HomepageAudience | null
+}
+
+export function rowSurface(row: { surface?: string | null }): HomepageSurface {
+  return row.surface === 'app' || row.surface === 'web_mobile' ? row.surface : 'web'
+}
+
+export function rowPage(row: { page?: string | null }): HomepagePage {
+  return HOMEPAGE_PAGES.includes(row.page as HomepagePage) ? (row.page as HomepagePage) : 'home'
+}
+
+export function rowAudience(row: { audience?: string | null }): HomepageAudience {
+  return row.audience === 'business' ? 'business' : 'store'
+}
+
+export const isListingPage = (page: HomepagePage) => page !== 'home'
+
+/** Hero slides of one surface (its own only: no surface borrows another's). */
+export function slidesForSurface<T extends { surface?: string | null }>(rows: T[], surface: HomepageSurface): T[] {
+  return rows.filter(r => rowSurface(r) === surface)
+}
+
+export const onSurface = (section: { surface?: string | null }, surface: HomepageSurface): boolean => rowSurface(section) === surface
+
+/** One surface's sections (pass one page's rows). */
+export function forSurface<T extends { surface?: string | null }>(rows: T[], surface: HomepageSurface): T[] {
+  return rows.filter(r => onSurface(r, surface))
+}
+
+/** A row is one full-width section, or a `left` section followed by a `right` one. */
+export type SectionSide = 'full' | 'left' | 'right'
+
+export const SECTION_SIDES_LAYOUT: SectionSide[] = ['full', 'left', 'right']
+
+/** `config.layout.side`; anything else is full width. */
+export function sectionSide(section: { config?: Record<string, unknown> | null }): SectionSide {
+  const layout = section.config?.layout
+  const side = layout && typeof layout === 'object' ? (layout as { side?: unknown }).side : null
+  return side === 'left' || side === 'right' ? side : 'full'
+}
+
+/**
+ * Groups ordered sections into rows: a `left` immediately followed by a `right` share one; any
+ * other section (including a half with no partner) takes a row of its own, full width.
+ */
+export function groupRows<T extends { config?: Record<string, unknown> | null }>(sections: T[]): T[][] {
+  const rows: T[][] = []
+  for (let i = 0; i < sections.length; i++) {
+    const s = sections[i]
+    const next = sections[i + 1]
+    if (sectionSide(s) === 'left' && next && sectionSide(next) === 'right') {
+      rows.push([s, next])
+      i++
+    } else rows.push([s])
+  }
+  return rows
+}
+
+export interface SectionMeta {
+  label: string
+  description: string
+  /** A singleton may only appear once on the page. */
+  singleton?: boolean
+  /** Surfaces that can use the type; absent means all. Phone browsers count as the website. */
+  surfaces?: HomepageSurface[]
+  /** Pages that can use the type; absent means all. */
+  pages?: HomepagePage[]
+  /** Homepages that can use the type; absent means both. */
+  audiences?: HomepageAudience[]
+  /** The plan scope the type needs (see getHomepagePlan); absent means every plan. */
+  plan?: string
+  /** Types this one cannot share a layout with (two auto-advancing heroes, say). */
+  excludes?: SectionType[]
+  /** The admin can set the shape of what this names ("Banner", "Card image"); `auto` keeps the component's own. */
+  aspect?: string
+  /** A full-width banner a tall shape narrows: the admin picks what fills the row beside it (sectionSides);
+   *  `slides` can also show the neighbouring slides there. */
+  sides?: 'banner' | 'slides'
+}
+
+/** The types the picker offers on a page and homepage (`surface` narrows to one surface's). */
+export function sectionTypesFor(
+  surface: HomepageSurface | 'all',
+  page: HomepagePage = 'home',
+  audience: HomepageAudience = 'store'
+): SectionType[] {
+  const asSurface = surface === 'web_mobile' ? 'web' : surface
+  return SECTION_TYPES.filter(t => {
+    const { surfaces, pages, audiences } = SECTION_META[t]
+    return (
+      (!surfaces || asSurface === 'all' || surfaces.includes(asSurface)) &&
+      (!pages || pages.includes(page)) &&
+      (!audiences || audiences.includes(audience))
+    )
+  })
+}
+
+/** Where a listing-page section sits: after the Nth product, and again every M products. */
+export interface SectionPlacement {
+  after: number
+  every: number | null
+}
+
+export const PLACEMENT_DEFAULT_AFTER = 12
+export const PLACEMENT_MIN_EVERY = 4
+const PLACEMENT_MAX_REPEATS = 12
+
+export function sectionPlacement(section: Pick<HomepageSection, 'config'>): SectionPlacement {
+  const p = (section.config?.placement ?? {}) as { after?: unknown; every?: unknown }
+  const after = Number(p.after)
+  const every = Number(p.every)
+  return {
+    after: p.after != null && Number.isInteger(after) && after >= 0 && after <= 1000 ? after : PLACEMENT_DEFAULT_AFTER,
+    every: Number.isInteger(every) && every >= PLACEMENT_MIN_EVERY ? every : null,
+  }
+}
+
+/** The product counts a section follows, within `total`: a section never trails the last product. */
+export function placementPositions(p: SectionPlacement, total: number, max = PLACEMENT_MAX_REPEATS): number[] {
+  const out: number[] = []
+  for (let at = p.after; at < total && out.length < (p.every ? max : 1); at += p.every ?? total) out.push(at)
+  return out
+}
+
+export const SECTION_ASPECTS = ['auto', '21:9', '16:9', '3:1', '5:3', '4:3', '1:1', '4:5', '3:4'] as const
+export type SectionAspect = (typeof SECTION_ASPECTS)[number]
+
+export const aspectRatioOf = (aspect: SectionAspect): number | null => {
+  if (aspect === 'auto') return null
+  const [w, h] = aspect.split(':').map(Number)
+  return w / h
+}
+
+export function sectionAspectValue(section: Pick<HomepageSection, 'type' | 'config'>): SectionAspect {
+  const value = section.config?.aspect as SectionAspect | undefined
+  return SECTION_META[section.type]?.aspect && value && SECTION_ASPECTS.includes(value) ? value : 'auto'
+}
+
+/** The section's chosen shape as width / height, or null for the component's own look. */
+export const sectionAspect = (section: Pick<HomepageSection, 'type' | 'config'>): number | null =>
+  aspectRatioOf(sectionAspectValue(section))
+
+/** Beside a banner narrower than its row: nothing, a soft shadow, its picture blurred, or the previous and next slides. */
+export const SECTION_SIDES = ['plain', 'shadow', 'glow', 'peek'] as const
+export type SectionSides = (typeof SECTION_SIDES)[number]
+
+/** The choices a type offers; `peek` needs slides. */
+export function sideOptions(type: SectionType): SectionSides[] {
+  const kind = SECTION_META[type]?.sides
+  if (!kind) return []
+  return kind === 'slides' ? [...SECTION_SIDES] : SECTION_SIDES.filter(v => v !== 'peek')
+}
+
+export function sectionSides(section: Pick<HomepageSection, 'type' | 'config'>): SectionSides {
+  const value = section.config?.sides as SectionSides | undefined
+  return value && sideOptions(section.type).includes(value) ? value : 'plain'
+}
+
+const HOME_ONLY: HomepagePage[] = ['home']
+const STORE_ONLY: HomepageAudience[] = ['store']
+const BUSINESS_ONLY: HomepageAudience[] = ['business']
+
+/** The plan scope of the B2B portal; the business homepage needs it too. */
+export const BUSINESS_PLAN_SCOPE = 'business_customers:read'
+
+export const SECTION_META: Record<SectionType, SectionMeta> = {
+  hero: {
+    label: 'Hero slides',
+    description: 'Full-width rotating banner at the top of the page.',
+    singleton: true,
+    excludes: ['motion_hero'],
+    pages: HOME_ONLY,
+  },
+  offer_slider: {
+    label: 'Offer slider',
+    description: 'Centered offer cards with left and right peek, each linking to its filtered products.',
+    singleton: true,
+    aspect: 'Offer cards',
+    sides: 'banner',
+  },
+  trust_strip: { label: 'Trust strip', description: 'Row of delivery, returns and payment reassurances.' },
+  category_grid: {
+    label: 'Shop by category',
+    description: 'Grid or carousel of top-level categories.',
+    aspect: 'Category tiles',
+  },
+  brand_carousel: { label: 'Shop by brand', description: 'Grid or carousel of brands you stock.' },
+  product_row: {
+    label: 'Product row',
+    description: 'Featured, new arrivals, best sellers, on sale, or one category.',
+    aspect: 'Product images',
+  },
+  category_showcase: {
+    label: 'Category showcase',
+    description: 'Large category cards with product thumbnails.',
+    aspect: 'Product thumbnails',
+  },
+  deal_of_the_day: { label: 'Deal of the day', description: 'A small set of highlighted offers.' },
+  promo_banner: {
+    label: 'Promo banner',
+    description: 'Seasonal or sale banner. Supports a start and end date.',
+    aspect: 'Banner',
+    sides: 'banner',
+  },
+  featured_for_you: {
+    label: 'Featured for you',
+    description: 'Personalised picks. Hidden for signed-out visitors.',
+    singleton: true,
+  },
+  benefits: { label: 'Benefits', description: 'Why-shop-with-us tiles.' },
+  why_us: { label: 'Why us', description: 'Three larger cards explaining what sets the store apart.', singleton: true },
+  about: { label: 'About', description: 'Store story with stats.', singleton: true, pages: HOME_ONLY },
+  business_cta: {
+    label: 'Business CTA',
+    description: 'Banner promoting the B2B/bulk experience.',
+    singleton: true,
+    audiences: STORE_ONLY,
+    plan: BUSINESS_PLAN_SCOPE,
+  },
+  countdown_deal: {
+    label: 'Countdown deal',
+    description: 'One product in a full-width banner with a live countdown. Hides itself when the timer ends.',
+    aspect: 'Product image',
+  },
+  testimonials: {
+    label: 'Testimonials',
+    description: 'Approved customer reviews, highest rated first.',
+    singleton: true,
+  },
+  recently_viewed: {
+    label: 'Recently viewed',
+    description: "Each visitor's own recently viewed products. Hidden until they have viewed enough.",
+    singleton: true,
+    pages: ['home', 'category', 'brand'],
+  },
+  category_tabs: {
+    label: 'Category tabs',
+    description: 'Tabs for your top categories, each showing its best sellers.',
+  },
+  bundle_spotlight: {
+    label: 'Bundle spotlight',
+    description: 'Products sold as bundles, or ones you pick, with their saving.',
+  },
+  back_in_stock: {
+    label: 'Back in stock',
+    description: 'Products that sold out and have just been restocked.',
+    singleton: true,
+  },
+  blog_teaser: {
+    label: 'Guides and articles',
+    description: 'Cards linking to your guides, articles or blog posts.',
+    singleton: true,
+    aspect: 'Article images',
+  },
+  social_strip: {
+    label: 'Social strip',
+    description: 'A row of photos linking to your social posts.',
+    singleton: true,
+  },
+  value_stats: {
+    label: 'Store stats',
+    description: 'Animated live numbers: orders shipped, products, cities served, customers.',
+    singleton: true,
+  },
+  motion_hero: {
+    label: 'Animated hero',
+    description: 'Layered slides with a foreground image that drifts over the background and a headline that reveals itself.',
+    singleton: true,
+    excludes: ['hero'],
+    aspect: 'Banner',
+    sides: 'slides',
+  },
+  stories: {
+    label: 'Stories',
+    description: 'A row of tappable rings that open full-screen image stories with a Shop button.',
+    singleton: true,
+    pages: HOME_ONLY,
+  },
+  product_spotlight: {
+    label: 'Product spotlight',
+    description: 'One product, large, with callouts that appear as the visitor scrolls past.',
+    pages: HOME_ONLY,
+  },
+  rewards_game: {
+    label: 'Rewards game',
+    description: 'A spin-the-wheel or scratch card that gives signed-in customers a coupon.',
+    singleton: true,
+    pages: HOME_ONLY,
+    audiences: STORE_ONLY,
+    plan: 'campaigns:read',
+  },
+  slides: {
+    label: 'Slides',
+    description: 'A slider of offers, categories, products or your own animated slides.',
+  },
+  business_reorder: {
+    label: 'Reorder',
+    description: "The business's most-ordered products, with quick add. Signed-in businesses only.",
+    singleton: true,
+    pages: HOME_ONLY,
+    audiences: BUSINESS_ONLY,
+    plan: BUSINESS_PLAN_SCOPE,
+    aspect: 'Product images',
+  },
+  business_quotes: {
+    label: 'Quotes',
+    description: "Request a quote, and the business's open quotes with their status.",
+    singleton: true,
+    pages: HOME_ONLY,
+    audiences: BUSINESS_ONLY,
+    plan: 'business_rfqs:read',
+  },
+  business_offers: {
+    label: 'Business offers',
+    description: 'Products on a business discount: picked automatically for each business, or chosen by you.',
+    pages: HOME_ONLY,
+    audiences: BUSINESS_ONLY,
+    plan: BUSINESS_PLAN_SCOPE,
+    aspect: 'Product images',
+  },
+  business_account: {
+    label: 'Account snapshot',
+    description: 'Company, recent orders, payments due, open quotes and a sales contact. Signed-in businesses only.',
+    singleton: true,
+    pages: HOME_ONLY,
+    audiences: BUSINESS_ONLY,
+    plan: BUSINESS_PLAN_SCOPE,
+  },
+}
+
+export interface SectionCopy {
+  eyebrow?: string
+  title?: string
+  subtitle?: string
+  body?: string
+  imageUrl?: string
+  /** MP4/WebM for the section's banner image (promo, about); `imageUrl` is its poster. */
+  video?: string
+  ctaLabel?: string
+  ctaUrl?: string
+}
+
+/** Copy the storefront renders when a section leaves a field empty; the admin shows the same text. */
+export const SECTION_COPY_DEFAULTS = {
+  product_row: { title: 'Products', ctaLabel: 'View All', ctaUrl: '/products' },
+  category_grid: { eyebrow: 'Explore', title: 'Shop by Category' },
+  brand_carousel: { eyebrow: 'Trusted Names', title: 'Shop by Brand' },
+  category_showcase: { eyebrow: 'Shop by Category', title: 'Top Categories' },
+  deal_of_the_day: { eyebrow: 'Limited Time', title: 'Deal of the Day' },
+  featured_for_you: { eyebrow: 'Picked for you', title: 'Featured For You' },
+  why_us: { eyebrow: 'Why us', title: 'Built for Industry' },
+  about: {
+    eyebrow: 'About Us',
+    title: 'Your Trusted Hardware Partner',
+    body: 'We combine product breadth with expert service so your operations stay seamless and efficient.',
+    imageUrl: '/images/Working.png',
+    ctaLabel: 'Learn More',
+    ctaUrl: '/about',
+  },
+  business_cta: {
+    eyebrow: 'For Business',
+    title: 'Buying for a business?',
+    subtitle:
+      'Bulk discounts, GSTIN invoicing, and a dedicated account manager. Trusted by 500+ businesses across India.',
+    ctaLabel: 'Register Now',
+  },
+  countdown_deal: { eyebrow: 'Limited time', title: 'Deal ends soon', ctaLabel: 'Grab the deal' },
+  testimonials: { eyebrow: 'Customer reviews', title: 'What our customers say' },
+  recently_viewed: { title: 'Recently viewed' },
+  category_tabs: { eyebrow: 'Best sellers', title: 'Top picks by category' },
+  bundle_spotlight: { eyebrow: 'Better together', title: 'Bundle deals' },
+  back_in_stock: { eyebrow: 'Restocked', title: 'Back in stock' },
+  blog_teaser: { eyebrow: 'Guides', title: 'Tips and how-tos' },
+  social_strip: { eyebrow: 'Follow along', title: 'Find us on social', ctaLabel: 'Follow us' },
+  value_stats: { eyebrow: 'By the numbers', title: 'Trusted by our customers' },
+  stories: { eyebrow: 'Fresh today', title: 'Stories' },
+  product_spotlight: { eyebrow: 'Spotlight', ctaLabel: 'Shop now' },
+  rewards_game: { eyebrow: 'Your reward', title: 'Spin to win', ctaLabel: 'Play now' },
+  business_reorder: { eyebrow: 'Buy again', title: 'Reorder your regulars' },
+  business_quotes: {
+    eyebrow: 'Quotes',
+    title: 'Buying in bulk?',
+    subtitle: 'Send us your list and get a quote on business terms.',
+    ctaLabel: 'Request a quote',
+  },
+  business_offers: { eyebrow: 'Business prices', title: 'Your business offers' },
+  business_account: { eyebrow: 'Your account', title: 'Account at a glance' },
+} satisfies Partial<Record<SectionType, SectionCopy>>
+
+export function sectionCopyDefaults(type: SectionType): SectionCopy {
+  return (SECTION_COPY_DEFAULTS as Partial<Record<SectionType, SectionCopy>>)[type] ?? {}
+}
+
+/** Tiles the storefront shows while a tile section has none saved; the admin shows the same tiles. */
+export const SECTION_TILE_DEFAULTS = {
+  trust_strip: [
+    { icon: 'Truck', label: 'Free delivery above {amount}' },
+    { icon: 'Receipt', label: 'GST invoice on every order' },
+    { icon: 'Boxes', label: '10,000+ products in stock' },
+    { icon: 'CreditCard', label: 'Cash on delivery available' },
+  ],
+  benefits: [
+    {
+      icon: 'Receipt',
+      title: 'Save up to 18% with GST',
+      sub: 'Claim input tax credit on every purchase with a valid GSTIN invoice',
+    },
+    {
+      icon: 'CreditCard',
+      title: 'Bulk order discounts',
+      sub: 'Special pricing for businesses ordering in volume — contact us for a quote',
+    },
+    {
+      icon: 'Clock',
+      title: 'Dedicated account manager',
+      sub: 'Registered businesses get priority support and a personal account manager',
+    },
+  ],
+  why_us: [
+    {
+      icon: 'Zap',
+      title: 'Fast Delivery',
+      desc: 'Prompt dispatch and reliable delivery to your doorstep across India.',
+      color: 'primary',
+    },
+    {
+      icon: 'Boxes',
+      title: 'Wide Range',
+      desc: 'Fasteners, power tools, electrical, welding, and hundreds of industrial categories.',
+      color: 'accent',
+    },
+    {
+      icon: 'Clock',
+      title: '24/7 Support',
+      desc: 'Expert team always available to help you source the right product fast.',
+      color: 'secondary',
+    },
+  ],
+  about: [
+    { value: '10+', label: 'Years in Business' },
+    { value: '1000+', label: 'Happy Customers' },
+  ],
+} satisfies Partial<Record<SectionType, Record<string, string>[]>>
+
+// What every other store shows in place of the flagship's own claims (a hardware range, "10,000+ products",
+// "500+ businesses", a 24-hour RFQ promise, an account manager).
+export const TENANT_COPY_DEFAULTS = {
+  why_us: { eyebrow: 'Why us', title: 'Why shop with us' },
+  about: { eyebrow: 'About us', title: 'Our story', ctaLabel: 'Learn more', ctaUrl: '/about' },
+  business_cta: {
+    eyebrow: 'For business',
+    title: 'Buying for a business?',
+    subtitle: 'Business prices, GST invoices and quotes for bulk orders.',
+    ctaLabel: 'Register now',
+  },
+} satisfies Partial<Record<SectionType, SectionCopy>>
+
+export const TENANT_TILE_DEFAULTS = {
+  trust_strip: [
+    { icon: 'Truck', label: 'Free delivery above {amount}' },
+    { icon: 'Receipt', label: 'GST invoice on every order' },
+    { icon: 'ShieldCheck', label: 'Secure payments' },
+    { icon: 'CreditCard', label: 'Cash on delivery available' },
+  ],
+  benefits: SECTION_TILE_DEFAULTS.benefits.slice(0, 2),
+  why_us: [
+    {
+      icon: 'PackageCheck',
+      title: 'Packed with care',
+      desc: 'Every order is checked and packed before it ships, with tracking to your door.',
+      color: 'primary',
+    },
+    { icon: 'ShieldCheck', title: 'Secure checkout', desc: 'Pay safely by UPI, card or net banking.', color: 'accent' },
+    { icon: 'MessageCircle', title: 'Here to help', desc: 'Write or call us about any order and we will sort it out.', color: 'secondary' },
+  ],
+} satisfies Partial<Record<SectionType, Record<string, string>[]>>
+
+/** A section's empty-field copy: the flagship's own, or the neutral one for every other store. */
+export function copyDefaultsFor(type: SectionType, flagship: boolean): SectionCopy {
+  const own = sectionCopyDefaults(type)
+  if (flagship) return own
+  // The flagship's pictures and About text are its own too; cleared here so a merge over its defaults drops them.
+  return { ...own, imageUrl: undefined, body: undefined, ...(TENANT_COPY_DEFAULTS as Partial<Record<SectionType, SectionCopy>>)[type] }
+}
+
+/** A tile section's tiles when none are saved, for the flagship or any other store (whose About gets no figures). */
+export function tileDefaultsFor(type: SectionType, flagship: boolean): Record<string, string>[] | null {
+  const table: Partial<Record<SectionType, Record<string, string>[]>> = flagship
+    ? SECTION_TILE_DEFAULTS
+    : { ...SECTION_TILE_DEFAULTS, about: [], ...TENANT_TILE_DEFAULTS }
+  return table[type] ?? null
+}
+
+/** Trust tiles a store can stand behind: no free-delivery tile without a threshold, no COD tile with COD off. */
+export function honestTrustTiles<I extends { icon: string; label: string }>(tiles: I[], o: { freeShippingThreshold: number; codEnabled: boolean }): I[] {
+  return tiles.filter(t => (o.freeShippingThreshold > 0 || !t.label.includes('{amount}')) && (o.codEnabled || !/cash on delivery|\bcod\b/i.test(t.label)))
+}
+
+/** The About stats from the store's stats JSON setting, else the built-in tiles (`fallback: false` = none: the built-in
+ *  figures are the flagship's, never another store's claims). */
+export function resolveAboutStats(statsJson: string, fallback = true): { value: string; label: string }[] {
+  if (statsJson.trim()) {
+    try {
+      const parsed = JSON.parse(statsJson)
+      if (
+        Array.isArray(parsed) &&
+        parsed.length &&
+        parsed.every(s => s && typeof s.value === 'string' && typeof s.label === 'string')
+      ) {
+        return parsed
+      }
+    } catch {
+      /* fall through to the built-in tiles */
+    }
+  }
+  return fallback ? SECTION_TILE_DEFAULTS.about : []
+}
+
+/** The About story when the section has none: the store's own about copy, else a line naming the store. */
+export function defaultAboutCopy(storeAboutCopy: string, storeName: string): string {
+  return storeAboutCopy.trim() || `${storeName} brings you a curated range of quality products, delivered across India.`
+}
+
+const DEFAULT_LIMITS: Partial<Record<SectionType, number>> = {
+  category_grid: 8,
+  brand_carousel: 8,
+  category_showcase: 4,
+  deal_of_the_day: 4,
+  testimonials: 6,
+  recently_viewed: 6,
+  bundle_spotlight: 4,
+  back_in_stock: 8,
+  business_reorder: 8,
+  business_offers: 8,
+  business_quotes: 3,
+}
+
+export function sectionLimit(section: Pick<HomepageSection, 'type' | 'config'>, fallback?: number): number {
+  const raw = section.config?.limit
+  const n = typeof raw === 'number' ? raw : parseInt(String(raw ?? ''), 10)
+  if (Number.isFinite(n) && n > 0) return n
+  return fallback ?? DEFAULT_LIMITS[section.type] ?? 8
+}
+
+export function sectionLayout(section: Pick<HomepageSection, 'config'>): SectionLayout {
+  return section.config?.layout === 'carousel' ? 'carousel' : 'grid'
+}
+
+export function productSource(section: Pick<HomepageSection, 'config'>): ProductSource {
+  const s = section.config?.source
+  return s === 'new_arrivals' || s === 'best_sellers' || s === 'on_sale' || s === 'category' ? s : 'featured'
+}
+
+/** Cache key so two rows with identical settings cost one query. */
+export function productRowKey(section: Pick<HomepageSection, 'config'>, limit: number): string {
+  const categorySlug = typeof section.config?.categorySlug === 'string' ? section.config.categorySlug : ''
+  return `${productSource(section)}:${limit}:${categorySlug}`
+}
+
+/** A positive whole-number config value, capped, else the fallback. */
+export function configNumber(
+  section: Pick<HomepageSection, 'config'>,
+  key: string,
+  fallback: number,
+  max = 100
+): number {
+  const raw = section.config?.[key]
+  const n = typeof raw === 'number' ? raw : parseInt(String(raw ?? ''), 10)
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), max) : fallback
+}
+
+const GUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+/** Record ids saved in config (picked products or categories); anything malformed is dropped. */
+export function configIds(section: Pick<HomepageSection, 'config'>, key: string): string[] {
+  const raw = section.config?.[key]
+  return Array.isArray(raw) ? raw.filter((v): v is string => typeof v === 'string' && GUID.test(v)) : []
+}
+
+/** An admin-entered link, kept only when it is a site path or an http(s) URL (never javascript:). */
+export function safeHref(url: string | null | undefined): string | null {
+  const u = (url ?? '').trim()
+  return /^(https?:\/\/|\/(?![/\\]))/i.test(u) ? u : null
+}
+
+export function configId(section: Pick<HomepageSection, 'config'>, key: string): string | null {
+  const raw = section.config?.[key]
+  return typeof raw === 'string' && GUID.test(raw) ? raw : null
+}
+
+const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() ? v.trim() : null)
+const objects = (raw: unknown): Record<string, unknown>[] =>
+  Array.isArray(raw) ? raw.filter((r): r is Record<string, unknown> => !!r && typeof r === 'object') : []
+
+// How an opaque foreground photo sits on the slide; 'none' is for transparent cutouts.
+export const FG_FRAMES = ['rounded', 'fade', 'none'] as const
+export type FgFrame = (typeof FG_FRAMES)[number]
+
+// Animated hero: `config.slides`, each with a background image and a headline at least.
+export interface MotionHeroSlide {
+  bgImage: string
+  /** MP4/WebM behind the slide; `bgImage` is its poster. Absent when unset. */
+  bgVideo?: string
+  fgImage: string | null
+  fgFrame: FgFrame
+  eyebrow: string | null
+  headline: string
+  sub: string | null
+  ctaLabel: string | null
+  url: string | null
+}
+
+export function motionHeroSlides(section: Pick<HomepageSection, 'config'>): MotionHeroSlide[] {
+  const slides: MotionHeroSlide[] = []
+  for (const r of objects(section.config?.slides)) {
+    const bgImage = safeHref(str(r.bgImage))
+    const headline = str(r.headline)
+    if (!bgImage || !headline) continue
+    const bgVideo = safeHref(str(r.bgVideo))
+    slides.push({
+      bgImage,
+      ...(bgVideo ? { bgVideo } : {}),
+      fgImage: safeHref(str(r.fgImage)),
+      fgFrame: FG_FRAMES.find(f => f === r.fgFrame) ?? 'rounded',
+      eyebrow: str(r.eyebrow),
+      headline,
+      sub: str(r.sub),
+      ctaLabel: str(r.ctaLabel),
+      url: safeHref(str(r.url)),
+    })
+    if (slides.length === 8) break
+  }
+  return slides
+}
+
+/** Seconds a slide stays before the next one; the editor stores `intervalSeconds`. */
+export function motionHeroIntervalMs(section: Pick<HomepageSection, 'config'>): number {
+  return Math.max(3, configNumber(section, 'intervalSeconds', 6, 20)) * 1000
+}
+
+// Stories: `config.groups`, each a titled ring with a cover and image slides.
+export interface StorySlide {
+  id: string
+  image: string
+  /** MP4/WebM for the slide; `image` is its poster. Absent when unset. */
+  video?: string
+  caption: string | null
+  ctaLabel: string | null
+  url: string | null
+  /** How long the slide shows, 2–15 s. */
+  seconds: number
+}
+
+export interface StoryGroup {
+  id: string
+  title: string
+  cover: string
+  slides: StorySlide[]
+}
+
+export function storyGroups(section: Pick<HomepageSection, 'config'>): StoryGroup[] {
+  const groups: StoryGroup[] = []
+  objects(section.config?.groups).forEach((g, gi) => {
+    const title = str(g.title)
+    const cover = safeHref(str(g.cover))
+    if (!title || !cover) return
+    const slides: StorySlide[] = []
+    objects(g.slides).forEach((s, si) => {
+      const image = safeHref(str(s.image))
+      if (!image) return
+      const secs = typeof s.seconds === 'number' ? s.seconds : parseFloat(String(s.seconds ?? ''))
+      const video = safeHref(str(s.video))
+      slides.push({
+        id: str(s.id) ?? `${gi}-${si}`,
+        image,
+        ...(video ? { video } : {}),
+        caption: str(s.caption),
+        ctaLabel: str(s.ctaLabel),
+        url: safeHref(str(s.url)),
+        seconds: Number.isFinite(secs) ? Math.min(15, Math.max(2, secs)) : 5,
+      })
+    })
+    if (slides.length === 0) return
+    groups.push({ id: str(g.id) ?? `group-${gi}`, title, cover, slides: slides.slice(0, 12) })
+  })
+  return groups.slice(0, 24)
+}
+
+// Slides: `config.items`, each pointing at an offer, category or product, or a slide of its own.
+export type SlidesLayout = 'cards' | 'banner' | 'rail' | 'fade'
+export type SlidesAspect = '4:5' | '1:1' | '16:9'
+export type SlideKind = 'offer' | 'category' | 'product' | 'custom'
+export type SlideMotion = 'none' | 'kenburns' | 'parallax' | 'reveal'
+
+export const SLIDES_LAYOUTS: SlidesLayout[] = ['cards', 'banner', 'rail', 'fade']
+export const SLIDES_ASPECTS: SlidesAspect[] = ['4:5', '1:1', '16:9']
+export const SLIDE_KINDS: SlideKind[] = ['offer', 'category', 'product', 'custom']
+export const SLIDE_MOTIONS: SlideMotion[] = ['none', 'kenburns', 'parallax', 'reveal']
+export const MAX_SLIDES = 12
+
+export interface CustomSlide {
+  id: string
+  kind: 'custom'
+  image: string
+  imageCard: string | null
+  /** MP4/WebM for `image` / `imageCard`, which are their posters. Absent when unset. */
+  video?: string
+  videoCard?: string
+  eyebrow: string | null
+  title: string
+  sub: string | null
+  ctaLabel: string | null
+  url: string | null
+  motion: SlideMotion
+}
+
+export type SlideItem =
+  | { id: string; kind: 'offer'; offerId: string }
+  | { id: string; kind: 'category'; categoryId: string }
+  | { id: string; kind: 'product'; productId: string }
+  | CustomSlide
+
+export interface SlidesConfig {
+  layout: SlidesLayout
+  aspect: SlidesAspect
+  autoplay: boolean
+  /** 3–20 s; only used with autoplay. */
+  intervalSeconds: number
+  items: SlideItem[]
+}
+
+const oneOf = <T extends string>(v: unknown, allowed: readonly T[], fallback: T): T =>
+  allowed.includes(v as T) ? (v as T) : fallback
+
+const guid = (v: unknown): string | null => (typeof v === 'string' && GUID.test(v) ? v : null)
+
+export function slidesConfig(section: Pick<HomepageSection, 'config'>): SlidesConfig {
+  const cfg = section.config ?? {}
+  const items: SlideItem[] = []
+  const seen = new Set<string>()
+  for (const [i, r] of objects(cfg.items).entries()) {
+    let id = str(r.id) ?? `slide-${i}`
+    if (seen.has(id)) id = `${id}-${i}`
+    let item: SlideItem | null = null
+    if (r.kind === 'offer') {
+      const offerId = guid(r.offerId)
+      if (offerId) item = { id, kind: 'offer', offerId }
+    } else if (r.kind === 'category') {
+      const categoryId = guid(r.categoryId)
+      if (categoryId) item = { id, kind: 'category', categoryId }
+    } else if (r.kind === 'product') {
+      const productId = guid(r.productId)
+      if (productId) item = { id, kind: 'product', productId }
+    } else if (r.kind === 'custom') {
+      const image = safeHref(str(r.image))
+      const title = str(r.title)
+      if (image && title) {
+        const video = safeHref(str(r.video))
+        const videoCard = safeHref(str(r.videoCard))
+        item = {
+          id,
+          kind: 'custom',
+          image,
+          imageCard: safeHref(str(r.imageCard)),
+          eyebrow: str(r.eyebrow),
+          title,
+          sub: str(r.sub),
+          ctaLabel: str(r.ctaLabel),
+          url: safeHref(str(r.url)),
+          motion: oneOf(r.motion, SLIDE_MOTIONS, 'none'),
+          ...(video ? { video } : {}),
+          ...(videoCard ? { videoCard } : {}),
+        }
+      }
+    }
+    if (!item) continue
+    seen.add(id)
+    items.push(item)
+    if (items.length === MAX_SLIDES) break
+  }
+  return {
+    layout: oneOf(cfg.layout, SLIDES_LAYOUTS, 'cards'),
+    aspect: oneOf(cfg.aspect, SLIDES_ASPECTS, '4:5'),
+    autoplay: cfg.autoplay === true,
+    intervalSeconds: Math.max(3, configNumber(section, 'intervalSeconds', 6, 20)),
+    items,
+  }
+}
+
+/** One resolved slide, whatever it points at; what the storefront and the app draw. */
+export interface SlideCard {
+  /** The item id from config, stable across edits. */
+  id: string
+  kind: SlideKind
+  href: string | null
+  title: string
+  eyebrow: string | null
+  sub: string | null
+  badge: string | null
+  /** A `bg-*` class for the badge pill, when the source sets one. */
+  badgeClass: string | null
+  ctaLabel: string | null
+  /** The wide picture (or the only one). */
+  image: string | null
+  /** The portrait 4:5 picture, when there is one. */
+  imageCard: string | null
+  /** MP4/WebM for the wide slot; `image` is its poster. */
+  video: string | null
+  /** MP4/WebM for the card; `imageCard` is its poster. */
+  videoCard: string | null
+  blurhash: string | null
+  blurhashCard: string | null
+  price?: number
+  mrp?: number | null
+  productId?: string
+  productSlug?: string
+  /** Product slides: the full card props, for the quick-add button. */
+  product?: CardProps
+  motion: SlideMotion
+}
+
+export type SlidesData = Omit<SlidesConfig, 'items'> & { slides: SlideCard[] }
+
+// Product spotlight: one picked product with short callouts.
+export interface SpotlightConfig {
+  productId: string | null
+  headline: string | null
+  callouts: string[]
+}
+
+export function spotlightConfig(section: Pick<HomepageSection, 'config'>): SpotlightConfig {
+  const raw = section.config?.callouts
+  const callouts = Array.isArray(raw) ? raw.map(str).filter((c): c is string => !!c).slice(0, 4) : []
+  return { productId: configId(section, 'productId'), headline: str(section.config?.headline), callouts }
+}
+
+// Rewards game: the admin saves any JSON, so the server re-validates on every play.
+export type RewardPrizeKind = 'percent' | 'fixed' | 'none'
+export type RewardPlayLimit = 'once' | 'daily' | 'weekly'
+export type RewardGameMode = 'wheel' | 'scratch'
+
+export interface RewardPrize {
+  id: string
+  label: string
+  kind: RewardPrizeKind
+  /** Percent off (1–90) or rupees off; 0 for a no-win segment. */
+  value: number
+  minPurchase: number
+  maxDiscount: number | null
+  /** Days the coupon stays valid, 1–365. */
+  validDays: number
+  /** Relative chance, > 0. */
+  weight: number
+}
+
+export interface RewardsGameConfig {
+  /** Minted by the editor; stable across publishes and layout copies so play limits hold. */
+  gameKey: string | null
+  mode: RewardGameMode
+  playLimit: RewardPlayLimit
+  prizes: RewardPrize[]
+}
+
+const num = (v: unknown, fallback: number): number => {
+  const n = typeof v === 'number' ? v : parseFloat(String(v ?? ''))
+  return Number.isFinite(n) ? n : fallback
+}
+
+export function rewardsGameConfig(section: Pick<HomepageSection, 'config'>): RewardsGameConfig {
+  const cfg = section.config ?? {}
+  const prizes: RewardPrize[] = []
+  for (const r of objects(cfg.prizes)) {
+    const id = str(r.id)
+    const label = str(r.label)
+    const kind: RewardPrizeKind = r.kind === 'percent' || r.kind === 'fixed' || r.kind === 'none' ? r.kind : 'none'
+    if (!id || !label) continue
+    const value = kind === 'none' ? 0 : num(r.value, 0)
+    if (kind === 'percent' && (value < 1 || value > 90)) continue
+    if (kind === 'fixed' && value <= 0) continue
+    const maxDiscount = kind === 'percent' ? num(r.maxDiscount, 0) : 0
+    const weight = num(r.weight, 1)
+    prizes.push({
+      id: id.slice(0, 64),
+      label: label.slice(0, 120),
+      kind,
+      value: Math.round(value * 100) / 100,
+      minPurchase: Math.max(0, num(r.minPurchase, 0)),
+      maxDiscount: maxDiscount > 0 ? maxDiscount : null,
+      validDays: Math.min(365, Math.max(1, Math.round(num(r.validDays, 30)))),
+      weight: weight > 0 ? weight : 1,
+    })
+    if (prizes.length === 12) break
+  }
+  return {
+    gameKey: configId(section, 'gameKey'),
+    mode: cfg.mode === 'scratch' ? 'scratch' : 'wheel',
+    playLimit: cfg.playLimit === 'daily' || cfg.playLimit === 'weekly' ? cfg.playLimit : 'once',
+    prizes,
+  }
+}
+
+/** A game needs its key and at least two prizes before anyone can play it. */
+export function rewardsGamePlayable(game: RewardsGameConfig): boolean {
+  return !!game.gameKey && game.prizes.length >= 2
+}
+
+export interface RewardsGamePublic {
+  gameKey: string
+  mode: RewardGameMode
+  playLimit: RewardPlayLimit
+  prizes: { id: string; label: string; kind: RewardPrizeKind }[]
+}
+
+/** What a client may know about a game: never the weights or the coupon terms. Null when unplayable. */
+export function rewardsGamePublic(section: Pick<HomepageSection, 'config'>): RewardsGamePublic | null {
+  const game = rewardsGameConfig(section)
+  if (!rewardsGamePlayable(game) || !game.gameKey) return null
+  return {
+    gameKey: game.gameKey,
+    mode: game.mode,
+    playLimit: game.playLimit,
+    prizes: game.prizes.map(p => ({ id: p.id, label: p.label, kind: p.kind })),
+  }
+}
+
+// Business sections. Their data is the signed-in business's own, so it loads per user on the client.
+
+/** What a signed-out visitor sees where a section needs a business account: nothing, or a sign-in prompt. */
+export type BusinessVisitorView = 'hide' | 'signin'
+
+export const businessVisitorView = (section: Pick<HomepageSection, 'config'>): BusinessVisitorView =>
+  section.config?.visitor === 'signin' ? 'signin' : 'hide'
+
+export type BusinessOffersSource = 'auto' | 'picked'
+
+export interface BusinessOffersConfig {
+  /** `auto`: products in the categories the business has a discount on, biggest discount first. */
+  source: BusinessOffersSource
+  productIds: string[]
+  limit: number
+}
+
+export function businessOffersConfig(section: Pick<HomepageSection, 'type' | 'config'>): BusinessOffersConfig {
+  const productIds = configIds(section, 'productIds').slice(0, 24)
+  return {
+    source: section.config?.source === 'picked' && productIds.length > 0 ? 'picked' : 'auto',
+    productIds,
+    limit: Math.min(sectionLimit(section), 24),
+  }
+}
+
+export const BUSINESS_ACCOUNT_TILES = ['orders', 'payments', 'quotes'] as const
+export type BusinessAccountTile = (typeof BUSINESS_ACCOUNT_TILES)[number]
+
+export interface BusinessContact {
+  name: string | null
+  phone: string | null
+  email: string | null
+}
+
+export interface BusinessAccountConfig {
+  tiles: BusinessAccountTile[]
+  /** Who the business can call; null when the section has none. */
+  contact: BusinessContact | null
+}
+
+export function businessAccountConfig(section: Pick<HomepageSection, 'config'>): BusinessAccountConfig {
+  const raw = section.config?.tiles
+  const tiles = Array.isArray(raw)
+    ? BUSINESS_ACCOUNT_TILES.filter(t => raw.includes(t))
+    : [...BUSINESS_ACCOUNT_TILES]
+  const c = (section.config?.contact ?? {}) as Record<string, unknown>
+  const contact = { name: str(c.name), phone: str(c.phone), email: str(c.email) }
+  return { tiles, contact: contact.name || contact.phone || contact.email ? contact : null }
+}
+
+/** A business section's settings as the clients read them; null for any other type. */
+export interface BusinessSectionPublic {
+  visitor: BusinessVisitorView
+  limit: number
+  offers?: Pick<BusinessOffersConfig, 'source' | 'productIds'>
+  account?: BusinessAccountConfig
+}
+
+export function businessSectionPublic(section: Pick<HomepageSection, 'type' | 'config'>): BusinessSectionPublic | null {
+  if (!BUSINESS_SECTION_TYPES.has(section.type)) return null
+  const visitor = businessVisitorView(section)
+  switch (section.type) {
+    case 'business_offers': {
+      const { source, productIds, limit } = businessOffersConfig(section)
+      return { visitor, limit, offers: { source, productIds } }
+    }
+    case 'business_account':
+      return { visitor, limit: 3, account: businessAccountConfig(section) }
+    case 'business_quotes':
+      return { visitor, limit: Math.min(sectionLimit(section), 10) }
+    default:
+      return { visitor, limit: Math.min(sectionLimit(section), 24) }
+  }
+}
+
+/** Days a product row badges products as new, or null when its Just Landed treatment is off. */
+export function justLandedDays(section: Pick<HomepageSection, 'config'>): number | null {
+  return section.config?.justLanded === true ? configNumber(section, 'newWithinDays', 30, 365) : null
+}
+
+export function launchedWithin(
+  product: { launch_date?: unknown; created_at?: unknown },
+  days: number,
+  now = Date.now()
+): boolean {
+  const raw = product.launch_date || product.created_at
+  const t = raw ? Date.parse(String(raw)) : NaN
+  return Number.isFinite(t) && t <= now && now - t <= days * 86_400_000
+}
+
+export type ValueStatMetric = 'orders_shipped' | 'products' | 'cities' | 'customers'
+
+export const VALUE_STAT_METRICS: { metric: ValueStatMetric; label: string }[] = [
+  { metric: 'orders_shipped', label: 'Orders shipped' },
+  { metric: 'products', label: 'Products to choose from' },
+  { metric: 'cities', label: 'Cities served' },
+  { metric: 'customers', label: 'Happy customers' },
+]
+
+const DEFAULT_VALUE_STATS: ValueStatMetric[] = ['orders_shipped', 'products', 'cities']
+
+/** Rounds down to a figure that stays true with a "+": 1,234 reads as 1,200+. */
+export function friendlyCount(n: number): string {
+  const step = n >= 1000 ? 100 : n >= 100 ? 10 : 1
+  const floored = Math.floor(n / step) * step
+  return `${floored.toLocaleString('en-IN')}${step > 1 ? '+' : ''}`
+}
+
+/** The stats a Store stats section shows, in catalogue order, each with its label. */
+export function valueStatMetrics(
+  section: Pick<HomepageSection, 'config'>
+): { metric: ValueStatMetric; label: string }[] {
+  const raw = section.config?.metrics
+  if (!Array.isArray(raw)) return VALUE_STAT_METRICS.filter(m => DEFAULT_VALUE_STATS.includes(m.metric))
+  const picked = new Map<string, string>()
+  for (const r of raw) {
+    if (r && typeof r === 'object' && typeof (r as Record<string, unknown>).metric === 'string') {
+      const label = (r as Record<string, unknown>).label
+      picked.set((r as Record<string, unknown>).metric as string, typeof label === 'string' ? label.trim() : '')
+    }
+  }
+  return VALUE_STAT_METRICS.filter(m => picked.has(m.metric)).map(m => ({
+    metric: m.metric,
+    label: picked.get(m.metric) || m.label,
+  }))
+}
+
+// Scheduling is evaluated here rather than in SQL: a SQL NOW() would be frozen into the
+// page's ISR cache entry and never re-evaluate.
+export function isWithinWindow(section: Pick<HomepageSection, 'starts_at' | 'ends_at'>, now = Date.now()): boolean {
+  if (section.starts_at && now < Date.parse(section.starts_at)) return false
+  if (section.ends_at && now > Date.parse(section.ends_at)) return false
+  return true
+}
+
+export function visibleSections(sections: HomepageSection[], now = Date.now()): HomepageSection[] {
+  return sections.filter(s => s.is_active && isWithinWindow(s, now)).sort((a, b) => a.display_order - b.display_order)
+}
+
+type DefaultSection = Omit<HomepageSection, 'id' | 'is_active' | 'starts_at' | 'ends_at'>
+
+const d = (
+  type: SectionType,
+  display_order: number,
+  extra: Partial<Omit<DefaultSection, 'type' | 'display_order'>> = {}
+): DefaultSection => ({
+  type,
+  title: null,
+  subtitle: null,
+  eyebrow: null,
+  cta_label: null,
+  cta_url: null,
+  config: {},
+  display_order,
+  ...extra,
+})
+
+// The layout a store starts with: provisioning seeds it, and a store with no saved sections renders it.
+// The engagement sections here need no setup and stay hidden until they have something to show.
+export const DEFAULT_SECTIONS: DefaultSection[] = [
+  d('hero', 0),
+  d('trust_strip', 1),
+  d('category_grid', 2, { title: 'Shop by Category', eyebrow: 'Browse' }),
+  d('product_row', 3, { title: 'Featured Products', eyebrow: 'Handpicked', config: { source: 'featured' } }),
+  d('brand_carousel', 4, { title: 'Shop by Brand', eyebrow: 'Trusted Names' }),
+  d('product_row', 5, {
+    title: 'New Arrivals',
+    eyebrow: 'Just In',
+    config: { source: 'new_arrivals', justLanded: true },
+  }),
+  d('category_showcase', 6, { title: 'Shop by Category', eyebrow: 'Explore' }),
+  d('featured_for_you', 7),
+  d('recently_viewed', 8),
+  d('product_row', 9, { title: 'Best Sellers', eyebrow: 'Popular', config: { source: 'best_sellers' } }),
+  d('category_tabs', 10),
+  d('back_in_stock', 11),
+  d('testimonials', 12),
+  d('benefits', 13),
+  d('why_us', 14, { title: 'Built for Industry', eyebrow: 'Why us' }),
+  d('value_stats', 15),
+  d('about', 16),
+  d('business_cta', 17),
+]
+
+export function withDefaults(rows: HomepageSection[]): HomepageSection[] {
+  if (rows.length > 0) return rows
+  return DEFAULT_SECTIONS.map((s, i) => ({
+    ...s,
+    id: `default-${i}`,
+    is_active: true,
+    starts_at: null,
+    ends_at: null,
+  }))
+}
+
+export interface PickerProduct {
+  id: string
+  name: string
+  sku: string | null
+  image_url: string | null
+  is_bundle: boolean
+}
+
+export interface PreviewItem {
+  id: string
+  name: string
+  image_url: string | null
+  price?: number | null
+  value?: string
+}
