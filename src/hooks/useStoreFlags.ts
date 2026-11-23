@@ -13,9 +13,11 @@ export interface StoreFlags {
   whatsappEnabled: boolean
   // App push for marketing: needs a store app build ID and both push switches.
   appPushEnabled: boolean
+  // A2UI renderer flag: mirrored from admin feature-flags endpoint.
+  a2uiEnabled: boolean
 }
 
-const OFF: StoreFlags = { loyaltyEnabled: false, referralEnabled: false, birthdayEnabled: false, smsEnabled: false, whatsappEnabled: false, appPushEnabled: false }
+const OFF: StoreFlags = { loyaltyEnabled: false, referralEnabled: false, birthdayEnabled: false, smsEnabled: false, whatsappEnabled: false, appPushEnabled: false, a2uiEnabled: false }
 
 let cached: StoreFlags | null = null
 let pending: Promise<StoreFlags> | null = null
@@ -33,6 +35,7 @@ function loadStoreFlags(): Promise<StoreFlags> {
           smsEnabled: data?.smsEnabled === true,
           whatsappEnabled: data?.whatsappEnabled === true,
           appPushEnabled: data?.appPushEnabled === true,
+          a2uiEnabled: data?.a2uiEnabled === true,
         }
         return cached
       })
