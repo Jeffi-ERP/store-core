@@ -77,6 +77,8 @@ export interface FeatureFlags {
   replyAutoApply: boolean
   // Customer subscriptions (Razorpay recurring). On by default; available on every plan.
   subscriptionsEnabled: boolean
+  // A2UI renderer for agent card blocks (Phase 1 spike). Off by default.
+  a2uiEnabled: boolean
 }
 
 export interface BusinessValues {
@@ -229,6 +231,7 @@ const DEFAULTS: SiteControls = {
     ondeviceFinetuneMobileEnabled:
       envBool(process.env.NEXT_PUBLIC_ENABLE_ONDEVICE_FINETUNE_MOBILE) ||
       process.env.NEXT_PUBLIC_ENABLE_ONDEVICE_FINETUNE_MOBILE === '1',
+    a2uiEnabled: false,
   },
   values: {
     codSurchargeFlat: envNum(process.env.COD_SURCHARGE_FLAT, 40),
@@ -332,6 +335,7 @@ const KEYS = [
   'feature_agent_whatsapp_enabled',
   'feature_reply_actions_enabled',
   'feature_reply_auto_apply',
+  'feature_a2ui_enabled',
   'feature_ondevice_summary_enabled',
   'feature_ondevice_finetune_enabled',
   'feature_ondevice_summary_mobile_enabled',
@@ -534,6 +538,7 @@ export async function getSiteControls(): Promise<SiteControls> {
         agentWhatsappEnabled: bool('feature_agent_whatsapp_enabled', d.flags.agentWhatsappEnabled),
         replyActionsEnabled: bool('feature_reply_actions_enabled', d.flags.replyActionsEnabled),
         replyAutoApply: bool('feature_reply_auto_apply', d.flags.replyAutoApply),
+        a2uiEnabled: bool('feature_a2ui_enabled', d.flags.a2uiEnabled),
         ondeviceSummaryEnabled: bool('feature_ondevice_summary_enabled', d.flags.ondeviceSummaryEnabled),
         ondeviceFinetuneEnabled: bool('feature_ondevice_finetune_enabled', d.flags.ondeviceFinetuneEnabled),
         ondeviceSummaryMobileEnabled: bool(

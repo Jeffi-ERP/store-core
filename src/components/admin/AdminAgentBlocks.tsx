@@ -10,6 +10,9 @@ import DocumentBlock, { type DocumentBlockData } from './agent/DocumentBlock'
 import ChangeSummaryBlock, { type ChangeSummaryBlockData } from './agent/ChangeSummaryBlock'
 import QuotationResolver, { type QuotationResolverBlock } from './agent/QuotationResolver'
 import { RecordCard, RecordCards, type CardBlockData, type CardsBlockData } from './agent/RecordCard'
+import { useStoreFlag } from '@/hooks/useStoreFlags'
+import A2UIRenderer from './agent/A2UIRenderer'
+import { cardToA2UIMessages } from '@/components/admin/agent/a2ui-card-mapper'
 
 function fmtPriceOrAsk(input: unknown): string {
   const n = parseNumber(input)
@@ -154,10 +157,11 @@ interface Props {
 }
 
 export default function AdminAgentBlocks({ blocks, onPickOption, pickerResolved, onSendMessage }: Props) {
+  const a2uiEnabled = useStoreFlag('a2uiEnabled')
   return (
     <div className="space-y-3">
       {blocks.map((block, i) => (
-        <div key={i}>{renderBlock(block, { onPickOption, pickerResolved, onSendMessage })}</div>
+        <div key={i}>{renderBlock(block, { onPickOption, pickerResolved, onSendMessage, a2uiEnabled }, i)}</div>
       ))}
     </div>
   )
@@ -165,7 +169,8 @@ export default function AdminAgentBlocks({ blocks, onPickOption, pickerResolved,
 
 function renderBlock(
   b: UiBlock,
-  ctx: { onPickOption?: Props['onPickOption']; pickerResolved?: boolean; onSendMessage?: (msg: string) => void }
+  ctx: { onPickOption?: Props['onPickOption']; pickerResolved?: boolean; onSendMessage?: (msg: string) => void; a2uiEnabled?: boolean },
+  blockIndex: number = 0
 ): ReactNode {
   switch (b.type) {
     case 'text': {
@@ -413,6 +418,10 @@ function renderBlock(
     case 'change_summary':
       return <ChangeSummaryBlock block={b} />
     case 'card':
+      if (ctx.a2uiEnabled) {
+        const msgs = cardToA2UIMessages(b, `card_${blockIndex}`)
+        return <A2UIRenderer messages={msgs} onSendMessage={ctx.onSendMessage} />
+      }
       return <RecordCard card={b} onSendMessage={ctx.onSendMessage} />
     case 'cards':
       return <RecordCards block={b} onSendMessage={ctx.onSendMessage} />
