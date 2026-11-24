@@ -12,7 +12,7 @@ import QuotationResolver, { type QuotationResolverBlock } from './agent/Quotatio
 import { RecordCard, RecordCards, type CardBlockData, type CardsBlockData } from './agent/RecordCard'
 import { useStoreFlag } from '@/hooks/useStoreFlags'
 import A2UIRenderer from './agent/A2UIRenderer'
-import { cardToA2UIMessages } from '@/lib/admin-agent/a2ui-card-mapper'
+import { cardToA2UIMessages } from '@/components/admin/agent/a2ui-card-mapper'
 
 function fmtPriceOrAsk(input: unknown): string {
   const n = parseNumber(input)

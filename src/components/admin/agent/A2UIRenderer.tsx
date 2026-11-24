@@ -6,7 +6,7 @@
 
 import { Component, useEffect, useMemo, useState } from 'react'
 import type { ReactNode } from 'react'
-import type { A2UIMessage } from '@/lib/admin-agent/a2ui-card-mapper'
+import type { A2UIMessage } from '@/components/admin/agent/a2ui-card-mapper'
 import { MessageProcessor } from '@a2ui/web_core/v0_9'
 import { basicCatalog } from '@a2ui/web_core/v0_9/basic_catalog'
 import { A2uiSurface } from '@a2ui/react/v0_9'
